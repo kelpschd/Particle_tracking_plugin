@@ -1,0 +1,11 @@
+name: napari-particle-tracker
+display_name: Particle Tracker
+schema_version: 0.1.0
+contributions:
+  commands:
+    - id: napari-particle-tracker.make_plugin_gui
+      title: Particle Tracker
+      python_name: napari_particle_tracker._tabs:make_plugin_gui
+  widgets:
+    - command: napari-particle-tracker.make_plugin_gui
+      display_name: Particle Tracker
