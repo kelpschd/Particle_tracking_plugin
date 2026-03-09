@@ -34,7 +34,7 @@ class ImageImportWidget(QWidget):
         * Name the layer based on ND2 metadata (e.g. "488 nm (GFP)")
           or fall back to "Ch 0", "Ch 1", ...
     """
-    
+
     layers_loaded = Signal()
 
     def __init__(self, viewer=None, parent=None):
@@ -269,3 +269,9 @@ class ImageImportWidget(QWidget):
                 else f"Ch {ch}"
             )
             self.viewer.add_image(img, name=label)
+        
+        if self.viewer is not None:
+            try:
+                self.layers_loaded.emit()
+            except Exception:
+                pass

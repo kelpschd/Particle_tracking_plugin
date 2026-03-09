@@ -4,6 +4,28 @@ from qtpy import QtWidgets, QtCore
 import numpy as np
 import pandas as pd
 
+# -------------------------
+# Tracks table helpers
+# -------------------------
+def show_tracks_table(viewer):
+    try:
+        tracks_layer = viewer.layers['Tracks']
+    except Exception:
+        show_warning("No 'Tracks' layer found.")
+        return
+    tracks_df = tracks_layer_to_dataframe(tracks_layer)
+    widget = TracksTableWidget(viewer, tracks_layer, tracks_df)
+    viewer.window.add_dock_widget(widget, name="Tracks Table", area="right")
+
+def _open_tracks_table(viewer):
+    tracks_layers = [ly for ly in viewer.layers if ly.__class__.__name__ == "Tracks"]
+    if not tracks_layers:
+        show_warning("No Tracks layer found.")
+        return
+    tracks_layer = tracks_layers[0]
+    tracks_df = tracks_layer_to_dataframe(tracks_layer)
+    widget = TracksTableWidget(viewer, tracks_layer, tracks_df)
+    viewer.window.add_dock_widget(widget, name="Tracks Table", area="right")
 
 class TracksTableWidget(QtWidgets.QWidget):
     """
@@ -199,121 +221,3 @@ class TracksTableWidget(QtWidgets.QWidget):
     def dataframe(self, df: pd.DataFrame):
         self._df = df.copy()
         self._populate_table_from_df()
-
-
-# ======================================================================
-# Helper functions to convert between DataFrame <-> napari Tracks layer
-# ======================================================================
-
-def tracks_layer_to_dataframe(tracks_layer) -> pd.DataFrame:
-    """
-    Convert a napari Tracks layer to a DataFrame.
-
-    Assumes:
-        - tracks_layer.data is (N, D+1), where first column is time/frame
-        - tracks_layer.properties contains 'track_id'
-
-    Returns
-    -------
-    df : pandas.DataFrame
-        Columns: ['track_id', 'frame', 'y', 'x'] or ['track_id', 'frame', 'z', 'y', 'x']
-        depending on dimensionality. Any extra properties are added as columns.
-    """
-    data = np.asarray(tracks_layer.data)
-    props = dict(tracks_layer.properties)
-
-    n_coords = data.shape[1] - 1  # excluding frame/time column
-    frame = data[:, 0]
-
-    if n_coords == 2:
-        y, x = data[:, 1], data[:, 2]
-        base = {"frame": frame, "y": y, "x": x}
-    elif n_coords == 3:
-        z, y, x = data[:, 1], data[:, 2], data[:, 3]
-        base = {"frame": frame, "z": z, "y": y, "x": x}
-    else:
-        # Fallback: create generic coord columns
-        base = {"frame": frame}
-        for i in range(n_coords):
-            base[f"coord_{i}"] = data[:, i + 1]
-
-    # Add properties (must be length N)
-    for key, values in props.items():
-        base[key] = values
-
-    df = pd.DataFrame(base)
-
-    # If there is no explicit track_id in properties, synthesize one
-    if "track_id" not in df.columns:
-        df["track_id"] = np.zeros(len(df), dtype=int)
-
-    return df
-
-
-def dataframe_to_tracks_layer_data(df: pd.DataFrame):
-    """
-    Convert a DataFrame back to (data, properties) for a napari Tracks layer.
-
-    Looks for these columns (if present):
-        - 'frame' or 't'
-        - 'z' (optional)
-        - 'y'
-        - 'x'
-        - 'track_id' (as a property)
-    Any other columns are returned as extra properties.
-
-    Returns
-    -------
-    data : (N, D+1) ndarray
-    properties : dict of {name: 1D array}
-    """
-    df = df.copy()
-
-    # time/frame column
-    if "frame" in df.columns:
-        t = df["frame"].to_numpy()
-    elif "t" in df.columns:
-        t = df["t"].to_numpy()
-    else:
-        # if no time, just zeros
-        t = np.zeros(len(df), dtype=float)
-
-    coords = []
-
-    # determine order: (z), y, x if present
-    coord_cols = []
-    if "z" in df.columns:
-        coord_cols.append("z")
-    if "y" in df.columns:
-        coord_cols.append("y")
-    if "x" in df.columns:
-        coord_cols.append("x")
-
-    if coord_cols:
-        for c in coord_cols:
-            coords.append(df[c].to_numpy())
-    else:
-        # fallback: use any 'coord_*' columns
-        coord_cols = [c for c in df.columns if c.startswith("coord_")]
-        coord_cols = sorted(coord_cols)
-        for c in coord_cols:
-            coords.append(df[c].to_numpy())
-
-    if coords:
-        coords_arr = np.vstack(coords).T  # shape (N, D)
-    else:
-        coords_arr = np.zeros((len(df), 0))
-
-    data = np.column_stack([t, coords_arr])
-
-    # properties: everything that is not a coordinate or frame
-    exclude_cols = set(["frame", "t", "z", "y", "x"])
-    exclude_cols.update(c for c in df.columns if c.startswith("coord_"))
-
-    properties = {}
-    for col in df.columns:
-        if col in exclude_cols:
-            continue
-        properties[col] = df[col].to_numpy()
-
-    return data, properties
