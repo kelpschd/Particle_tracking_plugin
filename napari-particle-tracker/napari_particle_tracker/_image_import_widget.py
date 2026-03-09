@@ -13,13 +13,14 @@ from qtpy.QtWidgets import (
     QFormLayout,
     QLineEdit,
 )
-from qtpy.QtCore import Qt
+
+from qtpy.QtCore import Qt, Signal
+from napari.layers import Image as NapariImage
 
 try:
     import nd2
 except ImportError:
     nd2 = None
-
 
 class ImageImportWidget(QWidget):
     """
@@ -33,6 +34,8 @@ class ImageImportWidget(QWidget):
         * Name the layer based on ND2 metadata (e.g. "488 nm (GFP)")
           or fall back to "Ch 0", "Ch 1", ...
     """
+    
+    layers_loaded = Signal()
 
     def __init__(self, viewer=None, parent=None):
         super().__init__(parent)
@@ -52,7 +55,7 @@ class ImageImportWidget(QWidget):
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setSpacing(1)
 
         # Title
         title = QLabel("ND2 import")

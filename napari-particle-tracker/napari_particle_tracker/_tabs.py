@@ -1,7 +1,7 @@
 # _tabs.py
 
 import pandas as pd
-from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QPushButton
+from qtpy.QtWidgets import QWidget, QGridLayout, QVBoxLayout, QTabWidget, QPushButton, QSizePolicy
 from magicgui.widgets import Container, Label
 from napari import current_viewer
 from napari.utils.notifications import show_warning
@@ -10,28 +10,22 @@ from ._widget import particle_detection_widget, tracking_widget
 from ._image_import_widget import ImageImportWidget
 from .tracks_table_widget import TracksTableWidget, tracks_layer_to_dataframe
 
+# keep the layer dropdowns fresh
+def _refresh_layer_choices(*_):
+    try:
+        particle_detection_widget.reset_choices()
+    except Exception:
+        pass
+    try:
+        tracking_widget.reset_choices()
+    except Exception:
+        pass
 
 def make_plugin_gui(viewer=None, **_):
     viewer = viewer or current_viewer()
 
     particle_detection_widget.viewer.value = viewer
     tracking_widget.viewer.value = viewer 
-
-    # keep the layer dropdown in tracking_widget fresh
-    def _refresh_layer_choices(*_):
-        try:
-            tracking_widget.reset_choices()
-        except Exception:
-            pass
-
-    # refresh when layers are added/removed/renamed
-    viewer.layers.events.inserted.connect(_refresh_layer_choices)
-    viewer.layers.events.removed.connect(_refresh_layer_choices)
-    viewer.layers.events.reordered.connect(_refresh_layer_choices)
-    viewer.layers.events.changed.connect(_refresh_layer_choices)
-
-    # also refresh once on startup
-    _refresh_layer_choices()
 
     tabs = QTabWidget()
     tabs.setTabPosition(QTabWidget.North)
@@ -42,6 +36,7 @@ def make_plugin_gui(viewer=None, **_):
     imp_layout.setContentsMargins(0, 0, 0, 0)
     imp_layout.setSpacing(0)
     import_widget = ImageImportWidget(viewer=viewer) 
+    import_widget.layers_loaded.connect(_refresh_layer_choices)
     imp_layout.addWidget(import_widget)
     tabs.addTab(import_page, "Import")
 
@@ -50,7 +45,8 @@ def make_plugin_gui(viewer=None, **_):
     det_layout = QVBoxLayout(detection_page)
     det_layout.setContentsMargins(0, 0, 0, 0)
     det_layout.setSpacing(0)
-    det_layout.addWidget(particle_detection_widget.native) 
+    det_layout.addWidget(particle_detection_widget.native)
+    det_layout.addStretch(1)
     tabs.addTab(detection_page, "Detection")
 
     # Tracking page
@@ -59,7 +55,17 @@ def make_plugin_gui(viewer=None, **_):
     trk_layout.setContentsMargins(0, 0, 0, 0)
     trk_layout.setSpacing(0)
     trk_layout.addWidget(tracking_widget.native)
+    trk_layout.addStretch(1)
     tabs.addTab(tracking_page, "Tracking")
+
+    # refresh when layers are added/removed/renamed
+    viewer.layers.events.inserted.connect(_refresh_layer_choices)
+    viewer.layers.events.removed.connect(_refresh_layer_choices)
+    viewer.layers.events.reordered.connect(_refresh_layer_choices)
+    viewer.layers.events.changed.connect(_refresh_layer_choices)
+
+    # also refresh once on startup
+    _refresh_layer_choices()
 
     # ------------------------------------------------------------------
     # Tracks Table page

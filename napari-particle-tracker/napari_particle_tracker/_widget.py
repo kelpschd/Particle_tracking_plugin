@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Optional
 from napari.layers import Points
+from napari.layers import Image as NapariImage
 from magicgui import magicgui
 import numpy as np
 import pandas as pd
@@ -30,6 +31,7 @@ def _get_active_image_layer_data(viewer):
             return L.data
     return None
 
+# Particle detection UI
 @magicgui(
     call_button="Run",
     layout="vertical",
@@ -60,17 +62,105 @@ def particle_detection_widget(
 ):
     """Detect puncta from a 3D single-channel stack (t,y,x) and optionally filter densely clustered blobs."""
 
-    # Auto-select the active image layer if none selected
-    if img_stack is None:
-        img_stack = _get_active_image_layer_data(viewer)
-        if img_stack is None:
-            show_info("Select an Image layer in 'Input time series' first.")
-            return
+    def _resolve_img_stack(img_stack, viewer):
+        from napari.utils.notifications import show_warning
 
-    arr = np.asarray(img_stack)
-    if arr.ndim != 3:
-        show_warning(f"Expected 3D (t,y,x); got {arr.shape}.")
+        # unwrap magicgui parameter wrapper
+        try:
+            if hasattr(img_stack, "value"):
+                img_stack = img_stack.value
+        except Exception:
+            pass
+
+        # If nothing selected, try active image layer
+        if img_stack is None:
+            candidate = _get_active_image_layer_data(viewer)
+            if candidate is None:
+                return None
+            arr = candidate
+        else:
+            # If a string layer name
+            if isinstance(img_stack, str):
+                layer = None
+                try:
+                    layer = viewer.layers[img_stack]
+                except Exception:
+                    for ly in viewer.layers:
+                        if getattr(ly, "name", None) == img_stack:
+                            layer = ly
+                            break
+                if layer is None:
+                    print(f"_resolve_img_stack: no layer named {img_stack!r}")
+                    return None
+                arr = getattr(layer, "data", None)
+
+            # If napari Image layer
+            elif hasattr(img_stack, "data"):
+                arr = img_stack.data
+
+            else:
+                arr = img_stack
+
+        # Handle dask / lazy arrays
+        try:
+            import dask.array as da
+            if isinstance(arr, da.Array):
+                arr = arr.compute()
+        except Exception:
+            pass
+
+        # Convert to numpy
+        try:
+            arr = np.asarray(arr)
+        except Exception as e:
+            print("_resolve_img_stack: np.asarray failed:", e)
+            return None
+
+        if arr.size == 0:
+            print("_resolve_img_stack: array has size 0")
+            return None
+
+        # 2D → treat as single frame
+        if arr.ndim == 2:
+            arr = arr[np.newaxis, ...]
+
+        # 3D → expected case
+        if arr.ndim == 3:
+            return arr
+
+        # 4D → assume (t, c, y, x) → pick channel 0
+        if arr.ndim == 4:
+            if arr.shape[1] <= 8:
+                show_warning(f"Input shape {arr.shape} looks like (t,c,y,x). Using channel 0.")
+                return arr[:, 0, ...]
+            raise ValueError(f"Ambiguous 4D shape {arr.shape}")
+
+        raise ValueError(f"Expected 3D (t,y,x); got {arr.shape}")
+
+    # Resolve input
+    try:
+        arr = _resolve_img_stack(img_stack, viewer)
+    except ValueError as e:
+        show_warning(str(e))
         return
+
+    if arr is None:
+        show_info("Select an Image layer in 'Input time series' first.")
+        return
+
+    print("particle_detection resolved array:", type(arr), arr.shape)
+
+    # # Auto-select the active image layer if none selected
+    # if img_stack is None:
+    #     img_stack = _get_active_image_layer_data(viewer)
+    #     if img_stack is None:
+    #         show_info("Select an Image layer in 'Input time series' first.")
+    #         return
+
+    # arr = np.asarray(img_stack)
+    # if arr.ndim != 3:
+    #     show_warning(f"Expected 3D (t,y,x); got {arr.shape}.")
+    #     return
 
     # --- Preprocess once (NumPy; fast) ---
     try:
@@ -151,7 +241,7 @@ def _wire_density_filter_controls(func_gui):
         func_gui.bin_size.visible = vis
         func_gui.blob_filter.visible = vis
 
-# new
+# Track UI
 @magicgui(
     call_button="Track",
     layout="vertical",
@@ -339,3 +429,46 @@ def _open_tracks_table(viewer):
 
     widget = TracksTableWidget(viewer, tracks_layer, tracks_df)
     viewer.window.add_dock_widget(widget, name="Tracks Table", area="right")
+
+def _get_viewer_from_widget(gui_widget):
+    """Return the napari Viewer instance associated with a magicgui widget."""
+    try:
+        if hasattr(gui_widget, "viewer") and getattr(gui_widget.viewer, "value", None) is not None:
+            return gui_widget.viewer.value
+        elif hasattr(gui_widget, "viewer") and gui_widget.viewer is not None:
+            return gui_widget.viewer
+    except Exception:
+        return None
+    return None
+
+def _detection_reset_choices():
+    """
+    Refresh choices for particle_detection_widget.img_stack using current Image layers.
+    Also set a valid .value so the dropdown visually updates.
+    """
+    try:
+        vw = _get_viewer_from_widget(particle_detection_widget)
+        if vw is None:
+            return
+
+        # Collect Image layer objects (not just names)
+        img_layers = [ly for ly in vw.layers if isinstance(ly, NapariImage)]
+        # Set the choices to layer objects (magicgui will display / pass them)
+        particle_detection_widget.img_stack.choices = img_layers
+
+        # Ensure a valid selected value — prefer the active layer if present,
+        # otherwise pick first available image layer.
+        cur = getattr(particle_detection_widget.img_stack, "value", None)
+        if cur not in img_layers:
+            # prefer active selected image layer
+            active = getattr(vw.layers.selection, "active", None)
+            preferred = active if (active in img_layers) else (img_layers[0] if img_layers else None)
+            particle_detection_widget.img_stack.value = preferred
+    except Exception as e:
+        print("detection reset_choices failed:", e)
+
+# Attach to the magicgui object so other code (e.g. _tabs._refresh_layer_choices) can call it.
+try:
+    particle_detection_widget.reset_choices = _detection_reset_choices
+except Exception:
+    pass

@@ -45,7 +45,7 @@ class TracksTableWidget(QtWidgets.QWidget):
     def _init_ui(self):
         layout = QtWidgets.QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        layout.setSpacing(1)
 
         # --- Table ---
         self.table = QtWidgets.QTableWidget()

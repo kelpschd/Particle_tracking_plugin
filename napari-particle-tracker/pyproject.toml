@@ -15,18 +15,17 @@ authors = [
 
 # These packages are needed when the plugin runs
 dependencies = [
-  "numpy",
-  "scipy",
-  "scikit-image",
-  "pandas",
-  "dask",
-  "napari",
-  "magicgui"
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "scikit-image>=0.21",
+  "pandas>=2.0",
+  "dask>=2023.2",
+  "napari>=0.5", 
+  "magicgui>=0.4",
+  "shapely>=2.0",
+  "trackpy>=0.6",
+  "filterpy>=1.4.5"
 ]
-
-# Optional extras, e.g. for tracking
-[project.optional-dependencies]
-tracking = ["trackpy>=0.6"]
 
 # Entry point for napari to find your plugin's manifest
 [project.entry-points."napari.manifest"]
