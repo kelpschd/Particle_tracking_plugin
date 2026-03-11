@@ -52,8 +52,8 @@ class KalmanTrack:
                               [0, 0, 0, 1]], dtype=float)
         self.kf.H = np.array([[1, 0, 0, 0],
                               [0, 1, 0, 0]], dtype=float)
-        self.kf.R *= 5.0
-        self.kf.P *= 1000.0
+        self.kf.R = np.eye(2) * 5.0
+        self.kf.P = np.eye(4) * 1000.0
         self.kf.Q = np.eye(4) * 0.1
         # store as (x,y) internally in kf state
         self.kf.x = np.array([x, y, 0.0, 0.0], dtype=float)
