@@ -442,76 +442,113 @@ class TracksListWidget(QWidget):
             self.table.setCellWidget(row_idx, 3, btn)
 
     def on_show_clicked(self, particle_id):
-        """Zoom/center the viewer to the bounding box of the selected track.
-
-        Does NOT add any temporary layer — just sets dims/frame/camera where possible.
-        """
+        """Zoom/center the viewer to the bounding box of the selected track (robust to camera/dim shapes)."""
         if self.tracks_df is None or self.tracks_df.empty:
             return
 
-        # select the track rows and sort by frame
-        track = self.tracks_df[self.tracks_df['particle'] == particle_id].sort_values('frame')
-        if track.empty:
+        # prefer authoritative coords from the Tracks layer if possible
+        layer = None
+        try:
+            tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
+            layer = tracks_layers[0] if tracks_layers else None
+        except Exception:
+            layer = None
+
+        # get per-particle rows (DataFrame fallback)
+        df_rows = self.tracks_df[self.tracks_df['particle'].astype(int) == int(particle_id)].sort_values('frame')
+
+        # Use layer.data when available (authoritative)
+        import numpy as np
+        if layer is not None:
+            ld = np.asarray(layer.data)
+            mask = ld[:, 0].astype(int) == int(particle_id)
+            if mask.sum() > 0:
+                rows = ld[mask]
+                ncols = rows.shape[1]
+                # expect last columns to be spatial coords: (..., y, x) or (..., z, y, x)
+                if ncols >= 4:
+                    y_coords = rows[:, -2].astype(float)
+                    x_coords = rows[:, -1].astype(float)
+                    frames = rows[:, 1].astype(int)
+                else:
+                    # fallback to DataFrame if unexpected shape
+                    y_coords = df_rows['y'].to_numpy(dtype=float) if 'y' in df_rows.columns else np.array([])
+                    x_coords = df_rows['x'].to_numpy(dtype=float) if 'x' in df_rows.columns else np.array([])
+                    frames = df_rows['frame'].to_numpy(dtype=int) if 'frame' in df_rows.columns else np.array([])
+            else:
+                y_coords = df_rows['y'].to_numpy(dtype=float) if 'y' in df_rows.columns else np.array([])
+                x_coords = df_rows['x'].to_numpy(dtype=float) if 'x' in df_rows.columns else np.array([])
+                frames = df_rows['frame'].to_numpy(dtype=int) if 'frame' in df_rows.columns else np.array([])
+        else:
+            y_coords = df_rows['y'].to_numpy(dtype=float) if 'y' in df_rows.columns else np.array([])
+            x_coords = df_rows['x'].to_numpy(dtype=float) if 'x' in df_rows.columns else np.array([])
+            frames = df_rows['frame'].to_numpy(dtype=int) if 'frame' in df_rows.columns else np.array([])
+
+        if len(x_coords) == 0 or len(y_coords) == 0:
             return
 
-        # coords: expect columns 'y','x' (z optional)
-        if 'y' not in track.columns or 'x' not in track.columns:
-            # nothing we can do
-            return
-
-        y_coords = track['y'].to_numpy(dtype=float)
-        x_coords = track['x'].to_numpy(dtype=float)
-        frames = track['frame'].to_numpy(dtype=int)
-
-        # choose center
+        # compute center (cx is x, cy is y)
         minx, maxx = float(x_coords.min()), float(x_coords.max())
         miny, maxy = float(y_coords.min()), float(y_coords.max())
         cx = 0.5 * (minx + maxx)
         cy = 0.5 * (miny + maxy)
 
-        # Jump to the first frame of the track (best-effort)
+        # 1) set time/frame (best-effort)
         try:
-            # common layout: axis 0 is time/frame
-            self.viewer.dims.set_point(0, int(frames[0]))
-        except Exception:
-            # some datasets may not be time-first; ignore silently
-            pass
-
-        # Center the camera (best-effort across napari versions)
-        centered = False
-        try:
-            # many napari versions expose a camera with a center property (x,y)
-            self.viewer.camera.center = (cx, cy)
-            centered = True
+            if len(frames) > 0:
+                # often axis 0 is time/frame
+                self.viewer.dims.set_point(0, int(frames[0]))
         except Exception:
             pass
 
-        if not centered:
-            # fallback: try setting dims spatial indices (commonly axis 1 -> y, axis 2 -> x)
+        # 2) center camera respecting camera.center length & ordering
+        # Napari camera.center can be 2-tuple (x,y) or 3-tuple (z,y,x) — handle both.
+        try:
+            cc = tuple(self.viewer.camera.center)
+        except Exception:
+            cc = None
+
+        if cc is None:
+            # fallback: set dims points for spatial axes: try axes 1->y, 2->x
             try:
-                # set spatial plane points (use ints)
                 self.viewer.dims.set_point(1, int(round(cy)))
                 self.viewer.dims.set_point(2, int(round(cx)))
-                centered = True
             except Exception:
                 pass
+        else:
+            try:
+                if len(cc) == 2:
+                    # (x, y)
+                    self.viewer.camera.center = (float(cx), float(cy))
+                elif len(cc) == 3:
+                    # (z, y, x) or similar: preserve non-spatial axis (first) and set y,x in last two slots
+                    z_val = float(cc[0])
+                    self.viewer.camera.center = (z_val, float(cy), float(cx))
+                else:
+                    # unknown length: try to set last two entries
+                    new_cc = list(cc)
+                    new_cc[-2] = float(cy)
+                    new_cc[-1] = float(cx)
+                    self.viewer.camera.center = tuple(new_cc)
+            except Exception:
+                # fallback: set dims spatial points
+                try:
+                    self.viewer.dims.set_point(1, int(round(cy)))
+                    self.viewer.dims.set_point(2, int(round(cx)))
+                except Exception:
+                    pass
 
-        # Heuristic zoom to fit bounding box: compute a zoom value and set it (best-effort)
+        # 3) optional: set zoom to fit bounding box (best-effort)
         try:
             width = max(1.0, maxx - minx)
             height = max(1.0, maxy - miny)
             max_dim = max(width, height)
-            # scale to a reasonable zoom range; tweak constants if you want different framing
             if max_dim > 0:
-                # this formula maps small bbox -> larger zoom, large bbox -> smaller zoom
                 zoom = max(0.2, min(10.0, 200.0 / max_dim))
-            else:
-                zoom = 1.0
-            try:
-                self.viewer.camera.zoom = float(zoom)
-            except Exception:
-                # fallback: some napari versions don't have camera.zoom writable
-                pass
+                try:
+                    self.viewer.camera.zoom = float(zoom)
+                except Exception:
+                    pass
         except Exception:
             pass
 
