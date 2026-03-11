@@ -425,21 +425,204 @@ class TracksListWidget(QWidget):
             self.populate_table(self.tracks_df)
         else:
             self.table.setRowCount(0)
-
     def populate_table(self, tracks_df: pd.DataFrame):
-        grouped = tracks_df.groupby('particle')
-        self.table.setRowCount(len(grouped))
-        for row_idx, (pid, group) in enumerate(grouped):
-            frames = sorted(group['frame'].unique().tolist())
-            frames_text = f"{frames[0]} - {frames[-1]}"
-            length = len(group)
+        """
+        Populate the QTableWidget with rows for each track.
+
+        Adds two buttons per row: Show (zoom/center) and Delete (remove track + optional puncta).
+        """
+        self.tracks_df = tracks_df.copy() if tracks_df is not None else None
+
+        if self.tracks_df is None or self.tracks_df.empty:
+            self.table.setRowCount(0)
+            return
+
+        # Determine authoritative particle id ordering from viewer Tracks layer if possible
+        try:
+            tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
+            if tracks_layers:
+                layer = tracks_layers[0]
+                layer_ids = np.unique(np.asarray(layer.data)[:, 0]).astype(int)
+            else:
+                layer_ids = None
+        except Exception:
+            layer_ids = None
+
+        try:
+            df_ids = np.unique(self.tracks_df['particle'].to_numpy().astype(int))
+        except Exception:
+            df_ids = None
+
+        if layer_ids is not None:
+            if df_ids is None or not np.array_equal(np.sort(df_ids), np.sort(layer_ids)):
+                pids = np.sort(layer_ids)
+            else:
+                pids = np.sort(df_ids)
+        else:
+            pids = np.sort(df_ids) if df_ids is not None else np.array([], dtype=int)
+
+        self.table.setRowCount(len(pids))
+        for row_idx, pid in enumerate(pids):
+            # extract rows (from current self.tracks_df)
+            if self.tracks_df is not None and 'particle' in self.tracks_df.columns:
+                group = self.tracks_df[self.tracks_df['particle'].astype(int) == int(pid)]
+                group = group.sort_values('frame') if 'frame' in group.columns else group
+            else:
+                group = pd.DataFrame()
+
+            if not group.empty and 'frame' in group.columns:
+                frames = sorted(group['frame'].unique().tolist())
+                frames_text = f"{int(frames[0])} - {int(frames[-1])}"
+                length = int(len(group))
+            else:
+                frames_text = "N/A"
+                length = 0
+
             self.table.setItem(row_idx, 0, QTableWidgetItem(str(int(pid))))
             self.table.setItem(row_idx, 1, QTableWidgetItem(frames_text))
             self.table.setItem(row_idx, 2, QTableWidgetItem(str(length)))
-            btn = QPushButton("Show")
-            btn.setProperty("particle", int(pid))
-            btn.clicked.connect(partial(self.on_show_clicked, pid))
-            self.table.setCellWidget(row_idx, 3, btn)
+
+            # Show button
+            show_btn = QPushButton("Show")
+            show_btn.setProperty("particle", int(pid))
+            show_btn.clicked.connect(partial(self.on_show_clicked, int(pid)))
+            self.table.setCellWidget(row_idx, 3, show_btn)
+
+            # Delete button (new)
+            del_btn = QPushButton("Delete")
+            del_btn.setProperty("particle", int(pid))
+            del_btn.clicked.connect(partial(self.on_delete_clicked, int(pid)))
+            # place delete in the next column (col 4) — ensure table has a column for it
+            # if your table has only 4 columns adjust earlier table creation to have 5 columns
+            # Here we create a new column widget cell at index 4:
+            if self.table.columnCount() < 5:
+                # increase columns (should be done at creation ideally)
+                self.table.setColumnCount(5)
+                self.table.setHorizontalHeaderLabels(["Track", "Frames", "Length", "", ""])
+                self.table.setColumnWidth(3, 80)
+                self.table.setColumnWidth(4, 80)
+            self.table.setCellWidget(row_idx, 4, del_btn)
+
+
+    def on_delete_clicked(self, particle_id, puncta_radius: float = 5.0):
+        """
+        Delete a track by particle_id from:
+        - self.tracks_df (internal DataFrame)
+        - the Napari Tracks layer (rebuild from remaining df)
+        - optionally remove associated puncta from a Points layer named 'Detected puncta' within puncta_radius (px)
+
+        puncta_radius: spatial radius in pixels to consider a punctum part of the track point.
+        """
+        if self.tracks_df is None or self.tracks_df.empty:
+            show_warning("No tracks available to delete.")
+            return
+
+        pid = int(particle_id)
+        # Filter out the particle rows from dataframe
+        remaining_df = self.tracks_df[self.tracks_df['particle'].astype(int) != pid].reset_index(drop=True)
+
+        # Update the Tracks layer: rebuild data & properties from remaining_df
+        try:
+            # helper that you already have in helpers.py
+            from ._helpers import dataframe_to_tracks_layer_data
+        except Exception:
+            show_warning("Could not import helpers to update Tracks layer.")
+            return
+
+        # Find the existing tracks layer (authoritative)
+        tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
+        if not tracks_layers:
+            show_warning("No Tracks layer found to update.")
+            # still update internal df and table
+            self.set_tracks(remaining_df)
+            return
+
+        layer = tracks_layers[0]
+
+        # Build new data/properties from remaining_df
+        try:
+            new_data, new_props = dataframe_to_tracks_layer_data(remaining_df)
+        except Exception as e:
+            show_warning(f"Failed to build updated tracks data: {e}")
+            return
+
+        # Apply to the layer (best-effort)
+        try:
+            layer.data = new_data
+            # layer.properties assignment may or may not be allowed depending on napari version
+            try:
+                layer.properties = new_props
+            except Exception:
+                # fallback: assign individual property arrays if supported
+                for k, v in new_props.items():
+                    try:
+                        layer.properties[k] = v
+                    except Exception:
+                        pass
+        except Exception as e:
+            show_warning(f"Failed to update Tracks layer: {e}")
+            return
+
+
+        points_layers = [ly for ly in self.viewer.layers if isinstance(ly, Points) and getattr(ly, "name", "") == "Detected puncta"]
+        if points_layers:
+            pts_layer = points_layers[0]
+            try:
+                pts_data = np.asarray(pts_layer.data)  # expect columns [frame, y, x]
+                if pts_data.size != 0:
+                    # collect indices to remove
+                    to_remove_idx = set()
+                    # the deleted particle rows (we can use the subset of self.tracks_df that matched pid)
+                    removed_rows = self.tracks_df[self.tracks_df['particle'].astype(int) == pid]
+                    # for each frame in removed_rows, find points on same frame and within radius
+                    from scipy.spatial import cKDTree
+                    for _, row in removed_rows.iterrows():
+                        f = int(row['frame'])
+                        y = float(row['y'])
+                        x = float(row['x'])
+                        # indices in pts_data for same frame
+                        frame_idx = np.where(pts_data[:, 0].astype(int) == f)[0]
+                        if frame_idx.size == 0:
+                            continue
+                        coords = pts_data[frame_idx][:, 1:3].astype(float)  # (y,x)
+                        if coords.size == 0:
+                            continue
+                        tree = cKDTree(coords)
+                        d, j = tree.query(np.array([y, x]), k=1)
+                        if d <= float(puncta_radius):
+                            # mark the original index for removal
+                            to_remove_idx.add(frame_idx[int(j)])
+                    if to_remove_idx:
+                        mask = np.ones(len(pts_data), dtype=bool)
+                        mask[list(to_remove_idx)] = False
+                        new_pts = pts_data[mask]
+                        # also filter properties if any
+                        try:
+                            new_props_pts = {}
+                            for k, v in getattr(pts_layer, "properties", {}).items():
+                                arr = np.asarray(v)
+                                new_props_pts[k] = arr[mask]
+                            pts_layer.data = new_pts
+                            try:
+                                pts_layer.properties = new_props_pts
+                            except Exception:
+                                # try assign individual properties
+                                for k, v in new_props_pts.items():
+                                    try:
+                                        pts_layer.properties[k] = v
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            # fallback: only set data
+                            pts_layer.data = new_pts
+            except Exception:
+                # don't fail deletion if puncta cleanup fails
+                pass
+
+        # Update internal dataframe and refresh table UI
+        self.set_tracks(remaining_df)
+
+        show_info(f"Deleted track {pid} (and removed {len(removed_rows) if 'removed_rows' in locals() else 0} track rows).")
 
     def on_show_clicked(self, particle_id):
         """Zoom/center the viewer to the bounding box of the selected track (robust to camera/dim shapes)."""
