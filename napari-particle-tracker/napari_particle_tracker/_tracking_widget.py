@@ -12,7 +12,12 @@ from qtpy.QtWidgets import (
     QSizePolicy, 
     QLabel, 
     QAbstractItemView,
-    QHeaderView
+    QHeaderView,
+    QDialog,
+    QHBoxLayout,
+    QMessageBox,
+    QLineEdit,
+    QFormLayout
 )
 from qtpy.QtCore import Qt
 
@@ -224,6 +229,18 @@ def filter_tracks_by_intersection_count(tracks_df, max_crossings=10):
     return tracks_df[tracks_df['particle'].isin(valid_particles)].reset_index(drop=True)
 
 # -------------------------
+# UI: Widget helpers
+# -------------------------
+def centered_cell_widget(button):
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    layout.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+    layout.addWidget(button)
+    return container
+
+# -------------------------
 # UI: Tracking widget
 # -------------------------
 # If thread_worker is None, we will not decorate but run synchronously; most users should have thread_worker.
@@ -417,8 +434,8 @@ class TracksListWidget(QWidget):
         layout.addWidget(header)
 
         # Table: columns: Track ID | Frames | Length | Show | Delete
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Track ID", "Frames\n(Range)", "Frames\n(Count)", "", ""])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Track ID", "Frames\n(Range)", "Frames\n(Count)", "", "", ""])
         self.table.horizontalHeader().setStretchLastSection(False)
 
         # Column widths & resize behavior
@@ -428,12 +445,14 @@ class TracksListWidget(QWidget):
         header_view.setSectionResizeMode(2, QHeaderView.Fixed)
         header_view.setSectionResizeMode(3, QHeaderView.Fixed)
         header_view.setSectionResizeMode(4, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(5, QHeaderView.Fixed)
 
         self.table.setColumnWidth(0, 60)
         self.table.setColumnWidth(1, 60)
         self.table.setColumnWidth(2, 60)
         self.table.setColumnWidth(3, 60)
         self.table.setColumnWidth(4, 60)
+        self.table.setColumnWidth(5, 60)
 
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -451,7 +470,7 @@ class TracksListWidget(QWidget):
     def populate_table(self, tracks_df: pd.DataFrame):
         """
         Populate the QTableWidget with rows for each track.
-        Adds Show and Delete buttons.
+        Adds Show, Delete, and Edit buttons.
         """
         self.tracks_df = tracks_df.copy() if tracks_df is not None else None
 
@@ -527,17 +546,27 @@ class TracksListWidget(QWidget):
                 show_btn = QPushButton("Show")
                 show_btn.setToolTip("Center viewer on this track")
                 show_btn.setProperty("particle", int(pid))
-                show_btn.setMaximumWidth(60)
+                show_btn.setMaximumWidth(55)
+                show_btn.setMaximumHeight(25)
                 show_btn.clicked.connect(partial(self.on_show_clicked, int(pid)))
-                self.table.setCellWidget(row_idx, 3, show_btn)
+                self.table.setCellWidget(row_idx, 3, centered_cell_widget(show_btn))
 
                 # Delete button
                 del_btn = QPushButton("Delete")
                 del_btn.setToolTip("Remove this track")
                 del_btn.setProperty("particle", int(pid))
-                del_btn.setMaximumWidth(60)
+                del_btn.setMaximumWidth(55)
+                del_btn.setMaximumHeight(25)
                 del_btn.clicked.connect(partial(self.on_delete_clicked, int(pid)))
-                self.table.setCellWidget(row_idx, 4, del_btn)
+                self.table.setCellWidget(row_idx, 4, centered_cell_widget(del_btn))
+
+                # Edit button
+                edit_btn = QPushButton("Edit")
+                edit_btn.setToolTip("Manually edit spots for this track")
+                edit_btn.setMaximumWidth(55)
+                edit_btn.setMaximumHeight(25)
+                edit_btn.clicked.connect(partial(self._on_edit_clicked, int(pid)))
+                self.table.setCellWidget(row_idx, 5, centered_cell_widget(edit_btn))
 
             # optionally select the first row
             if self.table.rowCount() > 0:
@@ -813,3 +842,708 @@ class TracksListWidget(QWidget):
         if self.tracks_df is not None and not self.tracks_df.empty:
             self.populate_table(self.tracks_df)
 
+    def _on_edit_clicked(self, particle_id: int):
+        """Show inline editor for particle_id (load rows into embedded editor)."""
+        pid = int(particle_id)
+        if self.tracks_df is None or self.tracks_df.empty:
+            show_warning("No tracks available.")
+            return
+        # find rows for pid
+        rows = self.tracks_df[self.tracks_df['particle'].astype(int) == pid]
+        edit_df = rows[['frame','y','x']].copy().reset_index(drop=True)
+        # create editor on demand if not present
+        if not hasattr(self, "editor") or self.editor is None:
+            self.editor = TrackEditorWidget(parent=self)
+            # add editor to layout below table (safe to append)
+            try:
+                self.layout().addWidget(self.editor, stretch=0)
+            except Exception:
+                pass
+        self.editor.load_track(pid, edit_df)
+        # scroll table to the track row
+        self._highlight_row_for_particle(pid)
+
+    def _apply_track_edits(self, particle_id: int, new_spots_df: pd.DataFrame):
+        """
+        Replace the rows for particle_id with new_spots_df (which must have columns frame,y,x),
+        then rebuild Tracks layer and optionally update Detected puncta.
+        """
+        pid = int(particle_id)
+        if self.tracks_df is None:
+            self.tracks_df = pd.DataFrame(columns=['particle','frame','y','x'])
+
+        # Remove old rows for pid and append new ones with particle column set
+        remaining = self.tracks_df[self.tracks_df['particle'].astype(int) != pid].copy()
+        new_rows = new_spots_df.copy()
+        new_rows['particle'] = pid
+        updated = pd.concat([remaining, new_rows], ignore_index=True, sort=False)
+
+        # canonical column order
+        canonical = ['particle','frame','y','x']
+        other_cols = [c for c in updated.columns if c not in canonical]
+        updated = updated[[c for c in canonical if c in updated.columns] + other_cols]
+
+        # update internal df
+        self.tracks_df = updated.copy()
+
+        # update Tracks layer via helper
+        try:
+            data, props = dataframe_to_tracks_layer_data(self.tracks_df)
+        except Exception as e:
+            show_warning(f"Failed to convert updated tracks: {e}")
+            return
+
+        tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
+        if not tracks_layers:
+            show_warning("No Tracks layer found to update.")
+            self.populate_table(self.tracks_df)
+            return
+
+        layer = tracks_layers[0]
+        try:
+            layer.data = data
+            try:
+                layer.properties = props
+            except Exception:
+                for k,v in props.items():
+                    try:
+                        layer.properties[k] = v
+                    except Exception:
+                        pass
+        except Exception as e:
+            show_warning(f"Failed to update Tracks layer: {e}")
+            return
+
+        # Optional: update Detected puncta (best-effort)
+        try:
+            pts_layers = [ly for ly in self.viewer.layers if isinstance(ly, Points) and getattr(ly, "name", "") == "Detected puncta"]
+            if pts_layers:
+                pts = pts_layers[0]
+                pts_data = np.asarray(pts.data)
+                # Use rounded integer keys to fuzzy-match points
+                def key_of_row(r): return (int(r['frame']), int(round(float(r['y']))), int(round(float(r['x']))))
+                existing_keys = { key_of_row({'frame':int(row[0]), 'y':row[1], 'x':row[2]}) for row in pts_data } if pts_data.size else set()
+                new_keys = { key_of_row(r) for _, r in new_spots_df.iterrows() }
+                old_rows = self.tracks_df[self.tracks_df['particle'].astype(int) == pid]
+                old_keys = { key_of_row(r) for _, r in old_rows[['frame','y','x']].iterrows() } if not old_rows.empty else set()
+
+                # Build keep mask removing old_keys not present in new_keys
+                keep_mask = []
+                for i in range(len(pts_data)):
+                    r = pts_data[i]
+                    k = (int(r[0]), int(round(float(r[1]))), int(round(float(r[2]))))
+                    if k in old_keys and k not in new_keys:
+                        keep_mask.append(False)
+                    else:
+                        keep_mask.append(True)
+                new_pts_arr = pts_data[np.array(keep_mask, dtype=bool)] if pts_data.size else pts_data
+
+                # add new points that aren't already present
+                rows_to_add = []
+                for _, r in new_spots_df.iterrows():
+                    k = key_of_row(r)
+                    if k not in existing_keys:
+                        rows_to_add.append([int(r['frame']), float(r['y']), float(r['x'])])
+                if rows_to_add:
+                    if new_pts_arr.size == 0:
+                        new_pts_arr = np.array(rows_to_add)
+                    else:
+                        new_pts_arr = np.vstack([new_pts_arr, np.array(rows_to_add)])
+                try:
+                    pts.data = new_pts_arr
+                except Exception:
+                    try:
+                        pts.data = np.asarray(new_pts_arr)
+                    except Exception:
+                        pass
+        except Exception:
+            # non-fatal
+            pass
+
+        # refresh UI
+        self.populate_table(self.tracks_df)
+        show_info(f"Saved edits for track {pid}.")
+
+class TrackEditorWidget(QWidget):
+    """
+    Embedded editor that shows the spots for a single track and allows
+    add/remove/edit/save/cancel. Meant to be placed under TracksListWidget.table.
+    """
+
+    def __init__(self, parent: "TracksListWidget" = None):
+        super().__init__(parent)
+        self.parent_widget: "TracksListWidget" = parent
+        self.current_pid = None
+        self._build_ui()
+        self.setVisible(False)  # hidden until needed
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        title_row = QHBoxLayout()
+        self.title_label = QLabel("Edit track: (none)")
+        title_row.addWidget(self.title_label)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+
+        # Spots table: now has an extra column for the Show button
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Frame", "Y", "X", ""])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 80)
+        self.table.setColumnWidth(3, 64)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.table, stretch=1)
+
+        # add/remove row buttons
+        br = QHBoxLayout()
+        self.add_btn = QPushButton("Add spot")
+        self.remove_btn = QPushButton("Remove selected")
+        br.addWidget(self.add_btn)
+        br.addWidget(self.remove_btn)
+        br.addStretch(1)
+        layout.addLayout(br)
+
+        # save / cancel
+        br2 = QHBoxLayout()
+        br2.addStretch(1)
+        self.cancel_btn = QPushButton("Cancel")
+        self.save_btn = QPushButton("Save")
+        br2.addWidget(self.cancel_btn)
+        br2.addWidget(self.save_btn)
+        layout.addLayout(br2)
+
+        # wire signals
+        self.add_btn.clicked.connect(self._on_add_spot)
+        self.remove_btn.clicked.connect(self._on_remove_selected)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        self.save_btn.clicked.connect(self._on_save)
+
+    def load_track(self, pid: int, spots_df: pd.DataFrame):
+        """Populate the editor with the given particle id's rows (frame,y,x)."""
+        self.current_pid = int(pid)
+        self.title_label.setText(f"Edit track: {self.current_pid}")
+        self._populate_from_df(spots_df)
+        self.setVisible(True)
+        # ensure parent layout shows the editor
+        try:
+            self.parent_widget.updateGeometry()
+        except Exception:
+            pass
+
+    def _populate_from_df(self, df: pd.DataFrame):
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.clearContents()
+            self.table.setRowCount(0)
+            if df is None or df.empty:
+                return
+            for _, row in df.sort_values('frame').iterrows():
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                # frame editable, y/x editable
+                f_item = QTableWidgetItem(str(int(row['frame'])))
+                y_item = QTableWidgetItem(f"{float(row['y']):.6f}")
+                x_item = QTableWidgetItem(f"{float(row['x']):.6f}")
+                self.table.setItem(r, 0, f_item)
+                self.table.setItem(r, 1, y_item)
+                self.table.setItem(r, 2, x_item)
+
+                # Show button for row
+                show_btn = QPushButton("Show")
+                show_btn.setMaximumWidth(56)
+                show_btn.setMaximumHeight(22)
+                # store numeric values on the button as properties for easy access
+                show_btn.setProperty("frame", int(row['frame']))
+                show_btn.setProperty("y", float(row['y']))
+                show_btn.setProperty("x", float(row['x']))
+                show_btn.clicked.connect(lambda _checked, b=show_btn: self._on_show_spot_button(b))
+                # center the button in the cell
+                container = QWidget()
+                vlay = QVBoxLayout(container)
+                vlay.setContentsMargins(0, 0, 0, 0)
+                vlay.setSpacing(0)
+                vlay.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+                vlay.addWidget(show_btn)
+                self.table.setCellWidget(r, 3, container)
+        finally:
+            self.table.setUpdatesEnabled(True)
+
+    def _on_add_spot(self):
+        """
+        Enter pick mode: user clicks in the napari canvas to add a spot.
+        If pick fails / user prefers manual entry, fall back to the old behavior.
+        """
+        viewer = getattr(self.parent_widget, "viewer", None) if getattr(self, "parent_widget", None) else None
+        if viewer is None:
+            # fallback to manual insert if no viewer is available
+            self._manual_add_row()
+            return
+
+        # toggle pick mode: one-shot by default (pick one point then stop)
+        # If already in picking mode, stop it.
+        if getattr(self, "_picking", False):
+            self._stop_pick_mode()
+            return
+
+        # start pick mode
+        self._start_pick_mode(viewer)
+
+
+    def _manual_add_row(self):
+        """Original fallback behaviour: insert an editable empty row."""
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem("0"))
+        self.table.setItem(r, 1, QTableWidgetItem("0.0"))
+        self.table.setItem(r, 2, QTableWidgetItem("0.0"))
+
+        # Add show button for new row and wire it to read values from the row on click
+        show_btn = QPushButton("Show")
+        show_btn.setMaximumWidth(56)
+        show_btn.setMaximumHeight(22)
+        show_btn.clicked.connect(lambda _checked, row=r: self._on_show_spot_from_row(row))
+        container = QWidget()
+        vlay = QVBoxLayout(container)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(0)
+        vlay.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        vlay.addWidget(show_btn)
+        self.table.setCellWidget(r, 3, container)
+
+        self.table.setCurrentCell(r, 0)
+        self.table.editItem(self.table.item(r, 0))
+    
+    def _start_pick_mode(self, viewer):
+        """Start a one-shot pick mode using a temporary Points layer in 'add' mode."""
+        # set state
+        self._picking = True
+        self.add_btn.setText("Click in viewer to add (Esc to cancel)")
+        self.add_btn.setEnabled(False)
+
+        # determine sensible ndim for the temporary points layer (prefer spatial dims)
+        try:
+            rep_layer = None
+            for ly in viewer.layers:
+                if hasattr(ly, "data") and getattr(ly, "data") is not None:
+                    rep_layer = ly
+                    break
+            if rep_layer is None:
+                ndim = 2
+            else:
+                ndim = len(np.array(getattr(rep_layer, "data")).shape)
+                # ensure at least 2
+                ndim = max(2, ndim)
+        except Exception:
+            ndim = 2
+
+        # try several add_points signatures to be compatible with different napari versions
+        tmp = None
+        try:
+            kwargs_try = dict(
+                data=np.empty((0, ndim)),
+                name="_pick_point_temp",
+                size=6,
+                ndim=ndim,
+                face_color="transparent",
+                edge_color="red",
+                properties={},
+            )
+            try:
+                tmp = viewer.add_points(**kwargs_try)
+            except TypeError:
+                # remove edge_color if rejected
+                kwargs_try.pop("edge_color", None)
+                try:
+                    tmp = viewer.add_points(**kwargs_try)
+                except TypeError:
+                    # last-resort minimal call (positional)
+                    tmp = viewer.add_points(np.empty((0, ndim)), name="_pick_point_temp")
+        except Exception as e:
+            # couldn't create a points layer — fall back to manual behavior
+            QMessageBox.information(self, "Add spot", f"Could not create temporary points layer: {e}\nFalling back to manual add.")
+            self._stop_pick_mode()
+            self._manual_add_row()
+            return
+
+        # keep references for cleanup
+        self._tmp_pick_layer = tmp
+        self._tmp_pick_handler = None
+
+        # Try to put the points layer into 'add' mode (some napari versions support .mode)
+        try:
+            tmp.mode = "add"
+        except Exception:
+            try:
+                # older versions sometimes use .interaction or similar; ignore if not supported
+                setattr(tmp, "mode", "add")
+            except Exception:
+                pass
+
+        # install escape shortcut to cancel
+        self._install_cancel_shortcut()
+
+        # handler invoked when the layer's data changes (user added a point)
+        def _on_tmp_points_changed(event=None):
+            try:
+                data_arr = np.asarray(getattr(self._tmp_pick_layer, "data", []))
+                if data_arr is None or len(data_arr) == 0:
+                    return
+                # take the last-added point
+                pt = np.asarray(data_arr[-1], dtype=float)
+
+                # normalize point -> extract x_val,y_val similar to earlier heuristics
+                if pt.ndim == 1 and pt.size >= 2:
+                    if pt.size == 2:
+                        # many napari point coords are (y,x) or (x,y). We assume incoming world point ordering
+                        # Try to infer: if your code expects (y,x) but many layers produce (y,x) already, we'll use:
+                        # Heuristic: treat as (y, x) when rep_layer.ndim >= 2 (common), but we keep fallback below.
+                        # To be conservative: assume pt == (y, x) if the first coord corresponds to row-index (y)
+                        y_val = float(pt[0])
+                        x_val = float(pt[1])
+                    else:
+                        # e.g., (z, y, x) -> last two are (y, x)
+                        y_val = float(pt[-2])
+                        x_val = float(pt[-1])
+                else:
+                    # conservative fallback: try tuple indexing
+                    try:
+                        y_val = float(pt[1])
+                        x_val = float(pt[0])
+                    except Exception:
+                        # can't interpret -> abort and fallback to manual
+                        raise RuntimeError(f"Could not interpret picked point: {pt}")
+
+                # determine frame from viewer.dims.point (prefer axis 0 if present)
+                try:
+                    cur_pts = tuple(viewer.dims.point)
+                    frame_idx = int(cur_pts[0]) if len(cur_pts) >= 1 else 0
+                except Exception:
+                    frame_idx = 0
+
+                # Insert new row into table with formatted values
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, QTableWidgetItem(str(int(frame_idx))))
+                self.table.setItem(r, 1, QTableWidgetItem(f"{float(y_val):.6f}"))
+                self.table.setItem(r, 2, QTableWidgetItem(f"{float(x_val):.6f}"))
+
+                # add show button for the new row
+                show_btn = QPushButton("Show")
+                show_btn.setMaximumWidth(56)
+                show_btn.setMaximumHeight(22)
+                show_btn.clicked.connect(lambda _checked, row=r: self._on_show_spot_from_row(row))
+                container = QWidget()
+                vlay = QVBoxLayout(container)
+                vlay.setContentsMargins(0, 0, 0, 0)
+                vlay.setSpacing(0)
+                vlay.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+                vlay.addWidget(show_btn)
+                self.table.setCellWidget(r, 3, container)
+
+                # cleanup pick mode and temp layer
+                try:
+                    # remove the temporary layer
+                    if getattr(self, "_tmp_pick_layer", None) is not None:
+                        try:
+                            self.viewer.layers.remove(self._tmp_pick_layer)
+                        except Exception:
+                            # if direct remove fails, try finding by name
+                            for ly in list(self.viewer.layers):
+                                if getattr(ly, "name", "") == "_pick_point_temp":
+                                    try:
+                                        self.viewer.layers.remove(ly)
+                                    except Exception:
+                                        pass
+                        self._tmp_pick_layer = None
+                except Exception:
+                    pass
+
+                # stop pick mode state & shortcut
+                self._stop_pick_mode()
+
+                # select and allow editing the frame cell
+                self.table.setCurrentCell(r, 0)
+                try:
+                    self.table.editItem(self.table.item(r, 0))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                # on any failure while interpreting the picked point, remove temp layer and fallback
+                print("Pick handler error:", e)
+                try:
+                    if getattr(self, "_tmp_pick_layer", None) is not None:
+                        try:
+                            self.viewer.layers.remove(self._tmp_pick_layer)
+                        except Exception:
+                            pass
+                        self._tmp_pick_layer = None
+                except Exception:
+                    pass
+                self._stop_pick_mode()
+                QMessageBox.information(self, "Add spot", f"Could not interpret picked point ({e}). Falling back to manual entry.")
+                self._manual_add_row()
+
+        # connect the handler to the points layer data events; different napari versions expose different events
+        try:
+            # preferred: points layer has .events.data
+            self._tmp_pick_handler = _on_tmp_points_changed
+            try:
+                self._tmp_pick_layer.events.data.connect(self._tmp_pick_handler)
+            except Exception:
+                # fallback: some versions use 'changed' or 'insert' events
+                try:
+                    self._tmp_pick_layer.events.changed.connect(self._tmp_pick_handler)
+                except Exception:
+                    # last fallback: poll via canvas mouse press — but we hope one of the above worked
+                    pass
+        except Exception:
+            # If we couldn't attach any handler, tell the user and fallback to manual
+            print("Warning: could not attach points layer change handler; falling back to manual add.")
+            try:
+                if getattr(self, "_tmp_pick_layer", None) is not None:
+                    try:
+                        self.viewer.layers.remove(self._tmp_pick_layer)
+                    except Exception:
+                        pass
+                    self._tmp_pick_layer = None
+            except Exception:
+                pass
+            self._stop_pick_mode()
+            self._manual_add_row()
+
+
+    def _stop_pick_mode(self):
+        """Stop pick mode and cleanup temporary layers and UI state."""
+        self._picking = False
+        try:
+            self.add_btn.setText("Add spot")
+            self.add_btn.setEnabled(True)
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_tmp_pick_layer", None) is not None:
+                # attempt to disconnect events cleanly
+                try:
+                    if hasattr(self._tmp_pick_layer.data, "events") and hasattr(self._tmp_pick_layer.data.events, "changed"):
+                        try:
+                            self._tmp_pick_layer.data.events.changed.disconnect()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    self.viewer.layers.remove(self._tmp_pick_layer)
+                except Exception:
+                    pass
+                self._tmp_pick_layer = None
+        except Exception:
+            pass
+
+        # remove cancel shortcut if installed
+        try:
+            if getattr(self, "_cancel_sc", None) is not None:
+                self._cancel_sc.setEnabled(False)
+                self._cancel_sc = None
+        except Exception:
+            pass
+
+
+    def _install_cancel_shortcut(self):
+        try:
+            from qtpy.QtWidgets import QShortcut
+            from qtpy.QtGui import QKeySequence
+            win = self.window()
+            if win is None:
+                return
+            sc = QShortcut(QKeySequence("Escape"), win)
+            sc.activated.connect(self._stop_pick_mode)
+            self._cancel_sc = sc
+        except Exception:
+            self._cancel_sc = None
+
+
+
+
+
+
+    def _on_remove_selected(self):
+        cur = self.table.currentRow()
+        if cur < 0:
+            QMessageBox.information(self, "Remove", "No row selected to remove.")
+            return
+        self.table.removeRow(cur)
+
+    def _gather_table_df(self) -> pd.DataFrame:
+        rows = []
+        for r in range(self.table.rowCount()):
+            f_item = self.table.item(r, 0)
+            y_item = self.table.item(r, 1)
+            x_item = self.table.item(r, 2)
+            if f_item is None or y_item is None or x_item is None:
+                continue
+            try:
+                f = int(float(f_item.text()))
+                y = float(y_item.text())
+                x = float(x_item.text())
+            except Exception as e:
+                raise ValueError(f"Invalid numeric value in row {r}: {e}")
+            rows.append({'frame': f, 'y': y, 'x': x})
+        if not rows:
+            return pd.DataFrame(columns=['frame','y','x'])
+        return pd.DataFrame(rows)
+
+    def _on_cancel(self):
+        self.setVisible(False)
+        self.current_pid = None
+
+    def _on_save(self):
+        try:
+            df = self._gather_table_df()
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid data", str(e))
+            return
+        # delegate application to parent widget
+        if self.parent_widget is not None:
+            self.parent_widget._apply_track_edits(self.current_pid, df)
+        # hide editor after save
+        self.setVisible(False)
+        self.current_pid = None
+
+    # -------------------------
+    # Show button helpers
+    # -------------------------
+    def _on_show_spot_button(self, button: QPushButton):
+        """Show using the coordinates embedded on the button (used when loading from df)."""
+        try:
+            frame = int(button.property("frame"))
+            y = float(button.property("y"))
+            x = float(button.property("x"))
+        except Exception:
+            return
+        self._center_view_on_spot(frame, y, x)
+
+    def _on_show_spot_from_row(self, row: int):
+        """Read values from a (possibly newly added/edited) table row and show."""
+        try:
+            f_item = self.table.item(row, 0)
+            y_item = self.table.item(row, 1)
+            x_item = self.table.item(row, 2)
+            if f_item is None or y_item is None or x_item is None:
+                return
+            frame = int(float(f_item.text()))
+            y = float(y_item.text())
+            x = float(x_item.text())
+        except Exception:
+            return
+        self._center_view_on_spot(frame, y, x)
+
+    def _center_view_on_spot(self, frame: int, y: float, x: float, debug: bool = False):
+        """
+        Simple centering assuming axes: 0=time, 1=y, 2=x.
+        Prefer dims.set_point; fallback to camera.center.
+        """
+        viewer = getattr(self.parent_widget, "viewer", None) if getattr(self, "parent_widget", None) else None
+        if viewer is None:
+            return
+
+        # set frame/time (axis 0)
+        try:
+            viewer.dims.set_point(0, int(frame))
+        except Exception:
+            pass
+
+        # Preferred: set spatial axes using dims.set_point (safe, updates viewer instantly)
+        try:
+            viewer.dims.set_point(1, int(round(y)))
+            viewer.dims.set_point(2, int(round(x)))
+            return
+        except Exception:
+            # fallback to camera manipulation
+            pass
+
+        # Fallback: try camera.center (handles 2- or 3-tuple camera.center)
+        try:
+            cc = tuple(viewer.camera.center)
+        except Exception:
+            cc = None
+
+        try:
+            if cc is None or len(cc) == 2:
+                viewer.camera.center = (float(x), float(y))
+            elif len(cc) >= 3:
+                new_cc = list(cc)
+                new_cc[-2] = float(y)   # put y in second-last slot
+                new_cc[-1] = float(x)   # put x in last slot
+                viewer.camera.center = tuple(new_cc)
+        except Exception:
+            pass
+
+        # optional small zoom reset so spot is visible
+        try:
+            viewer.camera.zoom = max(0.2, min(10.0, getattr(viewer.camera, "zoom", 1.0)))
+        except Exception:
+            pass
+
+        if debug:
+            print("Simple center attempted: frame", frame, "y", y, "x", x)
+
+    def _on_show_selected(self):
+        # parse selected row
+        cur = self.table.currentRow()
+        if cur < 0:
+            QMessageBox.information(self, "Show spot", "No row selected")
+            return
+        try:
+            frame = int(float(self.table.item(cur, 0).text()))
+            y = float(self.table.item(cur, 1).text())
+            x = float(self.table.item(cur, 2).text())
+        except Exception as e:
+            QMessageBox.information(self, "Show spot", f"Invalid numeric values: {e}")
+            return
+
+        # find the viewer (expect parent_widget to hold it)
+        viewer = getattr(self.parent_widget, "viewer", None) if hasattr(self, "parent_widget") else None
+        if viewer is None:
+            # fallback: try walk up parents
+            p = self.parent()
+            while p is not None and not hasattr(p, "viewer"):
+                p = p.parent()
+            viewer = getattr(p, "viewer", None) if p is not None else None
+
+        if viewer is None:
+            QMessageBox.information(self, "Show spot", "Could not find viewer to center.")
+            return
+
+        # set frame/time first (axis 0 is usually frame)
+        try:
+            viewer.dims.set_point(0, int(frame))
+        except Exception:
+            pass
+
+        # set spatial position using dims.set_point (preferred)
+        try:
+            viewer.dims.set_point(1, int(round(y)))
+            viewer.dims.set_point(2, int(round(x)))
+            return
+        except Exception:
+            # fallback to camera.center manipulation if dims.set_point doesn't work
+            try:
+                cc = tuple(viewer.camera.center)
+                if len(cc) == 2:
+                    viewer.camera.center = (float(x), float(y))
+                elif len(cc) >= 3:
+                    # keep leading axis value, replace last two with y,x
+                    new_cc = list(cc)
+                    new_cc[-2] = float(y)
+                    new_cc[-1] = float(x)
+                    viewer.camera.center = tuple(new_cc)
+            except Exception:
+                pass
