@@ -4,8 +4,15 @@ import pandas as pd
 from functools import partial
 
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QSizePolicy, QLabel
+    QWidget, 
+    QVBoxLayout, 
+    QTableWidget, 
+    QTableWidgetItem,
+    QPushButton, 
+    QSizePolicy, 
+    QLabel, 
+    QAbstractItemView,
+    QHeaderView
 )
 from qtpy.QtCore import Qt
 
@@ -406,38 +413,54 @@ class TracksListWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         header = QLabel("Tracks")
         header.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setMinimumHeight(40)
         layout.addWidget(header)
 
-        # Table: columns: Track ID | Frames | Length | Show button
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Track", "Frames", "Length", ""])
+        # Table: columns: Track ID | Frames | Length | Show | Delete
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Track ID", "Frames\n(Range)", "Frames\n(Count)", "", ""])
         self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.setColumnWidth(0, 80)
-        self.table.setColumnWidth(1, 120)
-        self.table.setColumnWidth(2, 60)
-        self.table.setColumnWidth(3, 80)
-        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        layout.addWidget(self.table)
-        layout.addStretch(1)
+        # Column widths & resize behavior
+        header_view = self.table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(1, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(2, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(3, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(4, QHeaderView.Fixed)
+
+        self.table.setColumnWidth(0, 60)
+        self.table.setColumnWidth(1, 60)
+        self.table.setColumnWidth(2, 60)
+        self.table.setColumnWidth(3, 60)
+        self.table.setColumnWidth(4, 60)
+
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+
+        layout.addWidget(self.table, stretch = 1)
 
         if self.tracks_df is not None and not self.tracks_df.empty:
             self.populate_table(self.tracks_df)
         else:
             self.table.setRowCount(0)
+
     def populate_table(self, tracks_df: pd.DataFrame):
         """
         Populate the QTableWidget with rows for each track.
-
-        Adds two buttons per row: Show (zoom/center) and Delete (remove track + optional puncta).
+        Adds Show and Delete buttons.
         """
         self.tracks_df = tracks_df.copy() if tracks_df is not None else None
 
         if self.tracks_df is None or self.tracks_df.empty:
+            self.table.clearContents()
             self.table.setRowCount(0)
             return
 
-        # Determine authoritative particle id ordering from viewer Tracks layer if possible
+        # Get authoritative particle ids from viewer Tracks layer if possible
         try:
             tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
             if tracks_layers:
@@ -461,48 +484,66 @@ class TracksListWidget(QWidget):
         else:
             pids = np.sort(df_ids) if df_ids is not None else np.array([], dtype=int)
 
-        self.table.setRowCount(len(pids))
-        for row_idx, pid in enumerate(pids):
-            # extract rows (from current self.tracks_df)
-            if self.tracks_df is not None and 'particle' in self.tracks_df.columns:
-                group = self.tracks_df[self.tracks_df['particle'].astype(int) == int(pid)]
-                group = group.sort_values('frame') if 'frame' in group.columns else group
-            else:
-                group = pd.DataFrame()
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.clearContents()
+            self.table.setRowCount(len(pids))
 
-            if not group.empty and 'frame' in group.columns:
-                frames = sorted(group['frame'].unique().tolist())
-                frames_text = f"{int(frames[0])} - {int(frames[-1])}"
-                length = int(len(group))
-            else:
-                frames_text = "N/A"
-                length = 0
+            for row_idx, pid in enumerate(pids):
+                # extract rows for this pid
+                if self.tracks_df is not None and 'particle' in self.tracks_df.columns:
+                    group = self.tracks_df[self.tracks_df['particle'].astype(int) == int(pid)]
+                    group = group.sort_values('frame') if 'frame' in group.columns else group
+                else:
+                    group = pd.DataFrame()
 
-            self.table.setItem(row_idx, 0, QTableWidgetItem(str(int(pid))))
-            self.table.setItem(row_idx, 1, QTableWidgetItem(frames_text))
-            self.table.setItem(row_idx, 2, QTableWidgetItem(str(length)))
+                if not group.empty and 'frame' in group.columns:
+                    frames = sorted(group['frame'].unique().tolist())
+                    frames_text = f"{int(frames[0])} – {int(frames[-1])}"
+                    length = int(len(group))
+                else:
+                    frames_text = "N/A"
+                    length = 0
 
-            # Show button
-            show_btn = QPushButton("Show")
-            show_btn.setProperty("particle", int(pid))
-            show_btn.clicked.connect(partial(self.on_show_clicked, int(pid)))
-            self.table.setCellWidget(row_idx, 3, show_btn)
+                # Track ID (non-editable, centered)
+                item_id = QTableWidgetItem(str(int(pid)))
+                item_id.setFlags(item_id.flags() & ~Qt.ItemIsEditable)
+                item_id.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_idx, 0, item_id)
 
-            # Delete button (new)
-            del_btn = QPushButton("Delete")
-            del_btn.setProperty("particle", int(pid))
-            del_btn.clicked.connect(partial(self.on_delete_clicked, int(pid)))
-            # place delete in the next column (col 4) — ensure table has a column for it
-            # if your table has only 4 columns adjust earlier table creation to have 5 columns
-            # Here we create a new column widget cell at index 4:
-            if self.table.columnCount() < 5:
-                # increase columns (should be done at creation ideally)
-                self.table.setColumnCount(5)
-                self.table.setHorizontalHeaderLabels(["Track", "Frames", "Length", "", ""])
-                self.table.setColumnWidth(3, 80)
-                self.table.setColumnWidth(4, 80)
-            self.table.setCellWidget(row_idx, 4, del_btn)
+                # Frames (range)
+                item_frames = QTableWidgetItem(frames_text)
+                item_frames.setFlags(item_frames.flags() & ~Qt.ItemIsEditable)
+                item_frames.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_idx, 1, item_frames)
 
+                # Length (count)
+                item_len = QTableWidgetItem(str(length))
+                item_len.setFlags(item_len.flags() & ~Qt.ItemIsEditable)
+                item_len.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_idx, 2, item_len)
+
+                # Show button
+                show_btn = QPushButton("Show")
+                show_btn.setToolTip("Center viewer on this track")
+                show_btn.setProperty("particle", int(pid))
+                show_btn.setMaximumWidth(60)
+                show_btn.clicked.connect(partial(self.on_show_clicked, int(pid)))
+                self.table.setCellWidget(row_idx, 3, show_btn)
+
+                # Delete button
+                del_btn = QPushButton("Delete")
+                del_btn.setToolTip("Remove this track")
+                del_btn.setProperty("particle", int(pid))
+                del_btn.setMaximumWidth(60)
+                del_btn.clicked.connect(partial(self.on_delete_clicked, int(pid)))
+                self.table.setCellWidget(row_idx, 4, del_btn)
+
+            # optionally select the first row
+            if self.table.rowCount() > 0:
+                self.table.selectRow(0)
+        finally:
+            self.table.setUpdatesEnabled(True)
 
     def on_delete_clicked(self, particle_id, puncta_radius: float = 5.0):
         """
@@ -523,7 +564,6 @@ class TracksListWidget(QWidget):
 
         # Update the Tracks layer: rebuild data & properties from remaining_df
         try:
-            # helper that you already have in helpers.py
             from ._helpers import dataframe_to_tracks_layer_data
         except Exception:
             show_warning("Could not import helpers to update Tracks layer.")
@@ -563,7 +603,6 @@ class TracksListWidget(QWidget):
             show_warning(f"Failed to update Tracks layer: {e}")
             return
 
-
         points_layers = [ly for ly in self.viewer.layers if isinstance(ly, Points) and getattr(ly, "name", "") == "Detected puncta"]
         if points_layers:
             pts_layer = points_layers[0]
@@ -572,7 +611,7 @@ class TracksListWidget(QWidget):
                 if pts_data.size != 0:
                     # collect indices to remove
                     to_remove_idx = set()
-                    # the deleted particle rows (we can use the subset of self.tracks_df that matched pid)
+                    # the deleted particle rows
                     removed_rows = self.tracks_df[self.tracks_df['particle'].astype(int) == pid]
                     # for each frame in removed_rows, find points on same frame and within radius
                     from scipy.spatial import cKDTree
@@ -622,7 +661,7 @@ class TracksListWidget(QWidget):
         # Update internal dataframe and refresh table UI
         self.set_tracks(remaining_df)
 
-        show_info(f"Deleted track {pid} (and removed {len(removed_rows) if 'removed_rows' in locals() else 0} track rows).")
+        show_info(f"Deleted track {pid} (and removed {len(removed_rows) if 'removed_rows' in locals() else 0} associated detected spots).")
 
     def on_show_clicked(self, particle_id):
         """Zoom/center the viewer to the bounding box of the selected track (robust to camera/dim shapes)."""
@@ -670,13 +709,13 @@ class TracksListWidget(QWidget):
         if len(x_coords) == 0 or len(y_coords) == 0:
             return
 
-        # compute center (cx is x, cy is y)
+        # compute center (cx is x, cy is y) of track
         minx, maxx = float(x_coords.min()), float(x_coords.max())
         miny, maxy = float(y_coords.min()), float(y_coords.max())
         cx = 0.5 * (minx + maxx)
         cy = 0.5 * (miny + maxy)
 
-        # 1) set time/frame (best-effort)
+        # set time/frame
         try:
             if len(frames) > 0:
                 # often axis 0 is time/frame
@@ -684,7 +723,7 @@ class TracksListWidget(QWidget):
         except Exception:
             pass
 
-        # 2) center camera respecting camera.center length & ordering
+        # center napari viewer respecting camera.center length & ordering
         # Napari camera.center can be 2-tuple (x,y) or 3-tuple (z,y,x) — handle both.
         try:
             cc = tuple(self.viewer.camera.center)
@@ -721,7 +760,7 @@ class TracksListWidget(QWidget):
                 except Exception:
                     pass
 
-        # 3) optional: set zoom to fit bounding box (best-effort)
+        # set zoom to fit bounding box (best-effort)
         try:
             width = max(1.0, maxx - minx)
             height = max(1.0, maxy - miny)
@@ -735,6 +774,31 @@ class TracksListWidget(QWidget):
         except Exception:
             pass
 
+        # highlight the row in the table
+        try:
+            self._highlight_row_for_particle(particle_id)
+        except Exception:
+            pass
+
+    def _highlight_row_for_particle(self, particle_id: int):
+        """Select and scroll to the table row corresponding to particle_id (no-op if not found)."""
+        pid_str = str(int(particle_id))
+        # find matching row in column 0 (Track ID column)
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item is None:
+                continue
+            try:
+                if item.text() == pid_str:
+                    # make this the current row and select it
+                    self.table.setCurrentCell(r, 0)
+                    self.table.selectRow(r)
+                    # center table to selected row
+                    # self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                    return
+            except Exception:
+                continue
+    
     def _remove_temp_layer(self):
         for layer in list(self.viewer.layers):
             if getattr(layer, "name", "").startswith(self.temp_layer_name):
