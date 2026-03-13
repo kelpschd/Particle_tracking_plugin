@@ -1126,6 +1126,19 @@ class TrackEditorWidget(QWidget):
         self.add_btn.setText("Click in viewer to add (Esc to cancel)")
         self.add_btn.setEnabled(False)
 
+        viewer = getattr(self.parent_widget, "viewer", None)
+        if viewer is None:
+            self._manual_add_row()
+            return
+
+        # Clean up any previous temp layers first
+        for layer in list(viewer.layers):
+            if getattr(layer, "name", "") == "_pick_point_temp":
+                try:
+                    viewer.layers.remove(layer)
+                except Exception:
+                    pass
+
         # determine sensible ndim for the temporary points layer (prefer spatial dims)
         try:
             rep_layer = None
@@ -1191,49 +1204,38 @@ class TrackEditorWidget(QWidget):
         # handler invoked when the layer's data changes (user added a point)
         def _on_tmp_points_changed(event=None):
             try:
-                data_arr = np.asarray(getattr(self._tmp_pick_layer, "data", []))
-                if data_arr is None or len(data_arr) == 0:
+                # read the latest data snapshot
+                data = np.asarray(tmp.data)
+                if data is None or data.size == 0:
                     return
-                # take the last-added point
-                pt = np.asarray(data_arr[-1], dtype=float)
+                # pick the last added point row
+                last = data[-1]
 
-                # normalize point -> extract x_val,y_val similar to earlier heuristics
-                if pt.ndim == 1 and pt.size >= 2:
-                    if pt.size == 2:
-                        # many napari point coords are (y,x) or (x,y). We assume incoming world point ordering
-                        # Try to infer: if your code expects (y,x) but many layers produce (y,x) already, we'll use:
-                        # Heuristic: treat as (y, x) when rep_layer.ndim >= 2 (common), but we keep fallback below.
-                        # To be conservative: assume pt == (y, x) if the first coord corresponds to row-index (y)
-                        y_val = float(pt[0])
-                        x_val = float(pt[1])
-                    else:
-                        # e.g., (z, y, x) -> last two are (y, x)
-                        y_val = float(pt[-2])
-                        x_val = float(pt[-1])
+                # normalize: last may be length ndim ; typical ordering is (z,y,x) or (y,x)
+                if last.ndim == 0:
+                    raise RuntimeError("unexpected point shape")
+                if len(last) >= 2:
+                    y_val = float(last[-2])
+                    x_val = float(last[-1])
                 else:
-                    # conservative fallback: try tuple indexing
-                    try:
-                        y_val = float(pt[1])
-                        x_val = float(pt[0])
-                    except Exception:
-                        # can't interpret -> abort and fallback to manual
-                        raise RuntimeError(f"Could not interpret picked point: {pt}")
+                    y_val = float(last[0])
+                    x_val = float(last[1]) if len(last) > 1 else 0.0
 
-                # determine frame from viewer.dims.point (prefer axis 0 if present)
+                # determine current frame/time from viewer.dims if available
                 try:
                     cur_pts = tuple(viewer.dims.point)
                     frame_idx = int(cur_pts[0]) if len(cur_pts) >= 1 else 0
                 except Exception:
                     frame_idx = 0
 
-                # Insert new row into table with formatted values
+                # insert into the table (one new row)
                 r = self.table.rowCount()
                 self.table.insertRow(r)
                 self.table.setItem(r, 0, QTableWidgetItem(str(int(frame_idx))))
                 self.table.setItem(r, 1, QTableWidgetItem(f"{float(y_val):.6f}"))
                 self.table.setItem(r, 2, QTableWidgetItem(f"{float(x_val):.6f}"))
 
-                # add show button for the new row
+                # add a Show button for the new row (same as manual flow)
                 show_btn = QPushButton("Show")
                 show_btn.setMaximumWidth(56)
                 show_btn.setMaximumHeight(22)
@@ -1246,33 +1248,92 @@ class TrackEditorWidget(QWidget):
                 vlay.addWidget(show_btn)
                 self.table.setCellWidget(r, 3, container)
 
-                # cleanup pick mode and temp layer
+                # disconnect handler if possible
                 try:
-                    # remove the temporary layer
-                    if getattr(self, "_tmp_pick_layer", None) is not None:
+                    if hasattr(tmp, "events") and hasattr(tmp.events, "data") and getattr(tmp.events, "data") is not None:
                         try:
-                            self.viewer.layers.remove(self._tmp_pick_layer)
+                            tmp.events.data.disconnect(_on_tmp_points_changed)
                         except Exception:
-                            # if direct remove fails, try finding by name
-                            for ly in list(self.viewer.layers):
-                                if getattr(ly, "name", "") == "_pick_point_temp":
-                                    try:
-                                        self.viewer.layers.remove(ly)
-                                    except Exception:
-                                        pass
-                        self._tmp_pick_layer = None
+                            pass
                 except Exception:
                     pass
 
-                # stop pick mode state & shortcut
-                self._stop_pick_mode()
-
-                # select and allow editing the frame cell
-                self.table.setCurrentCell(r, 0)
+                # remove the temporary layer immediately (best-effort)
                 try:
-                    self.table.editItem(self.table.item(r, 0))
+                    if tmp in list(viewer.layers):
+                        try:
+                            viewer.layers.remove(tmp)
+                        except Exception:
+                            # some napari versions require removal by name
+                            try:
+                                viewer.layers.remove("_pick_point_temp")
+                            except Exception:
+                                pass
                 except Exception:
                     pass
+
+                # clear stored refs so _stop_pick_mode doesn't double-remove or try to disconnect again
+                try:
+                    self._tmp_events_handler = None
+                except Exception:
+                    pass
+                try:
+                    self._tmp_pick_layer = None
+                except Exception:
+                    pass
+
+                # finalize: stop pick mode (restores UI, removes any lingering hooks)
+                try:
+                    self._stop_pick_mode()
+                except Exception:
+                    pass
+
+                # select the new row so user can tweak frame if desired
+                self.table.setCurrentCell(r, 0)
+                self.table.editItem(self.table.item(r, 0))
+
+            except Exception as e:
+                # on any failure, ensure pick mode stops and fallback to manual add
+                print("Pick handler error:", e)
+                # try disconnecting
+                try:
+                    if hasattr(tmp, "events") and hasattr(tmp.events, "data"):
+                        try:
+                            tmp.events.data.disconnect(_on_tmp_points_changed)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # try to remove temp layer
+                try:
+                    if tmp in list(viewer.layers):
+                        try:
+                            viewer.layers.remove(tmp)
+                        except Exception:
+                            try:
+                                viewer.layers.remove("_pick_point_temp")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                # clear stored refs
+                try:
+                    self._tmp_events_handler = None
+                except Exception:
+                    pass
+                try:
+                    self._tmp_pick_layer = None
+                except Exception:
+                    pass
+
+                # stop pick mode & fallback
+                try:
+                    self._stop_pick_mode()
+                except Exception:
+                    pass
+                QMessageBox.information(self, "Add spot", "Could not interpret clicked point. Falling back to manual entry.")
+                self._manual_add_row()
 
             except Exception as e:
                 # on any failure while interpreting the picked point, remove temp layer and fallback
@@ -1318,43 +1379,37 @@ class TrackEditorWidget(QWidget):
             self._stop_pick_mode()
             self._manual_add_row()
 
-
     def _stop_pick_mode(self):
-        """Stop pick mode and cleanup temporary layers and UI state."""
+        """Stop pick mode and remove any temporary pick layers."""
         self._picking = False
+
         try:
             self.add_btn.setText("Add spot")
             self.add_btn.setEnabled(True)
         except Exception:
             pass
 
-        try:
-            if getattr(self, "_tmp_pick_layer", None) is not None:
-                # attempt to disconnect events cleanly
-                try:
-                    if hasattr(self._tmp_pick_layer.data, "events") and hasattr(self._tmp_pick_layer.data.events, "changed"):
-                        try:
-                            self._tmp_pick_layer.data.events.changed.disconnect()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                try:
-                    self.viewer.layers.remove(self._tmp_pick_layer)
-                except Exception:
-                    pass
-                self._tmp_pick_layer = None
-        except Exception:
-            pass
+        viewer = getattr(self.parent_widget, "viewer", None)
+        if viewer is None:
+            return
 
-        # remove cancel shortcut if installed
+        # Remove ALL temp pick layers by name (safest approach)
+        for layer in list(viewer.layers):
+            if getattr(layer, "name", "") == "_pick_point_temp":
+                try:
+                    viewer.layers.remove(layer)
+                except Exception:
+                    pass
+
+        self._tmp_pick_layer = None
+
+        # Remove escape shortcut
         try:
             if getattr(self, "_cancel_sc", None) is not None:
                 self._cancel_sc.setEnabled(False)
                 self._cancel_sc = None
         except Exception:
             pass
-
 
     def _install_cancel_shortcut(self):
         try:
@@ -1368,11 +1423,6 @@ class TrackEditorWidget(QWidget):
             self._cancel_sc = sc
         except Exception:
             self._cancel_sc = None
-
-
-
-
-
 
     def _on_remove_selected(self):
         cur = self.table.currentRow()
