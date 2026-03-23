@@ -10,6 +10,7 @@ from ._tracking_widget import tracking_widget, TracksListWidget
 from ._image_import_widget import ImageImportWidget
 from .tracks_table_widget import TracksTableWidget
 from ._helpers import tracks_layer_to_dataframe, dataframe_to_tracks_layer_data
+from ._export import ExportWidget
 
 # keep the layer dropdowns fresh
 def _refresh_layer_choices(*_):
@@ -57,7 +58,7 @@ def make_plugin_gui(viewer=None, **_):
     trk_layout.setSpacing(0)
     trk_layout.addWidget(tracking_widget.native)
 
-    # --- NEW: Controls to open the dockable TracksListWidget ---
+    # --- Controls to open the dockable TracksListWidget ---
     open_tracks_list_btn = QPushButton("Open Tracks List")
     open_tracks_list_btn.setToolTip("Open a docked list of tracks (select a track to zoom/preview).")
     trk_layout.addWidget(open_tracks_list_btn)
@@ -65,7 +66,7 @@ def make_plugin_gui(viewer=None, **_):
     trk_layout.addStretch(1)
     tabs.addTab(tracking_page, "Tracking")
 
-    # Helper: find first Tracks layer and return (layer, dataframe)
+    # Find first Tracks layer and return (layer, dataframe) !move to helpers
     def _get_first_tracks_layer_and_df():
         tracks_layers = [ly for ly in viewer.layers if ly.__class__.__name__ == "Tracks"]
         if not tracks_layers:
@@ -74,7 +75,7 @@ def make_plugin_gui(viewer=None, **_):
         df = tracks_layer_to_dataframe(layer)
         return layer, df
 
-    # keep a single persistent tracks list on viewer.window
+    # keep a single persistent tracks list on viewer.window !move to helpers
     def _open_tracks_list_singleton():
         # reuse if exists
         existing = getattr(viewer.window, "_tracks_list_widget", None)
@@ -161,5 +162,19 @@ def make_plugin_gui(viewer=None, **_):
     viz_layout.setSpacing(0)
     viz_layout.addWidget(Container(widgets=[Label(value="Visualization page coming soon")]).native)
     tabs.addTab(viz_page, "Visualization")
+
+    # Export tab
+    export_page = QWidget()
+    exp_layout = QVBoxLayout(export_page)
+    exp_layout.setContentsMargins(0, 0, 0, 0)
+    exp_layout.setSpacing(0)
+
+    export_widget = ExportWidget(
+        viewer=viewer,
+        image_import_widget=import_widget,
+        tracks_table_widget=tracks_table_widget,
+    )
+    exp_layout.addWidget(export_widget)
+    tabs.addTab(export_page, "Export")
 
     return tabs
