@@ -410,6 +410,10 @@ class ExportWidget(QWidget):
         self.annotate = QCheckBox("Include overlays")
         self.annotate.setChecked(True)
 
+        self.save_kymo_btn = QPushButton("Export kymographs")
+        self.save_kymo_btn.clicked.connect(self._save_kymographs)
+        layout.addWidget(self.save_kymo_btn)
+
         layout.addWidget(QLabel("Padding"))
         layout.addWidget(self.padding)
         layout.addWidget(QLabel("FPS"))
@@ -545,3 +549,274 @@ class ExportWidget(QWidget):
             show_info("GIF export complete.")
         except Exception as e:
             show_error(str(e))
+
+    def _save_kymographs(self):
+        try:
+            out_dir = self.movie_dir.text().strip()
+            if not out_dir:
+                raise ValueError("Choose an output directory first.")
+
+            df = self._get_tracks_df()
+            arr = self._get_image_array()
+            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
+
+            export_all_track_kymographs_from_array(
+                img_array=arr,
+                tracks_df=df,
+                out_root=out_dir,
+                image_name=image_name,
+                L=200,
+                W=9,
+                width_reduce="mean",
+                include_all_frames=False,
+                frame_base=0,
+            )
+            show_info("Kymograph export complete.")
+        except Exception as e:
+            show_error(str(e))
+
+def validate_tracks_df(tracks_df: pd.DataFrame) -> None:
+    required = {"frame", "x", "y", "particle"}
+    missing = required - set(tracks_df.columns)
+    if missing:
+        raise ValueError(f"tracks_df missing columns: {missing}")
+    
+def kymograph_along_fixed_path(
+    stack: np.ndarray,          # (T, C, Y, X) or (T, Y, X)
+    frames_0based: np.ndarray,  # (N,)
+    path_xy: np.ndarray,        # (L,2)
+    width_px: int = 9,
+    width_reduce: str = "mean",  # "mean" or "max"
+    fill_value: float = np.nan,
+) -> np.ndarray:
+    if stack.ndim == 3:
+        stack = stack[:, None, :, :]
+    if stack.ndim != 4:
+        raise ValueError(f"stack must be (T,C,Y,X) or (T,Y,X), got {stack.shape}")
+
+    T, C, Y, X = stack.shape
+    frames_0based = np.asarray(frames_0based, dtype=int)
+    path_xy = np.asarray(path_xy, dtype=np.float32)
+
+    L = path_xy.shape[0]
+    if width_px < 1:
+        raise ValueError("width_px must be positive")
+
+    _, n_hat = tangents_and_normals_from_path(path_xy)
+
+    u = np.linspace(-(width_px - 1) / 2, (width_px - 1) / 2, width_px, dtype=np.float32)
+
+    kymo = np.full((len(frames_0based), C, L), fill_value, dtype=np.float32)
+
+    x0 = path_xy[:, 0]
+    y0 = path_xy[:, 1]
+    nx = n_hat[:, 0]
+    ny = n_hat[:, 1]
+
+    for i, t_idx in enumerate(frames_0based):
+        if t_idx < 0 or t_idx >= T:
+            continue
+
+        xs = x0[None, :] + u[:, None] * nx[None, :]
+        ys = y0[None, :] + u[:, None] * ny[None, :]
+
+        for c in range(C):
+            img = stack[t_idx, c].astype(np.float32)
+
+            vals = cv2.remap(
+                img,
+                xs.astype(np.float32),
+                ys.astype(np.float32),
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=np.nan,
+            )
+
+            if width_reduce == "max":
+                prof = np.nanmax(vals, axis=0)
+            else:
+                prof = np.nanmean(vals, axis=0)
+
+            kymo[i, c, :] = prof.astype(np.float32)
+
+    return kymo
+
+def resample_polyline_equal_arclength(xy: np.ndarray, n_samples: int) -> np.ndarray:
+    xy = np.asarray(xy, dtype=np.float32)
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise ValueError("xy must be (N,2) in (x,y)")
+
+    if xy.shape[0] < 2:
+        return np.repeat(xy[:1], n_samples, axis=0)
+
+    seg = xy[1:] - xy[:-1]
+    d = np.sqrt((seg ** 2).sum(axis=1))
+    s = np.concatenate([[0.0], np.cumsum(d)])
+    total = float(s[-1])
+
+    if total < 1e-6:
+        return np.repeat(xy[:1], n_samples, axis=0)
+
+    s_new = np.linspace(0, total, n_samples, dtype=np.float32)
+    x_new = np.interp(s_new, s, xy[:, 0])
+    y_new = np.interp(s_new, s, xy[:, 1])
+
+    return np.stack([x_new, y_new], axis=1).astype(np.float32)
+
+def tangents_and_normals_from_path(path_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    p = np.asarray(path_xy, dtype=np.float32)
+    if p.ndim != 2 or p.shape[1] != 2:
+        raise ValueError("path_xy must be (L,2) in (x,y)")
+
+    dp = np.zeros_like(p)
+    dp[1:-1] = p[2:] - p[:-2]
+    dp[0] = p[1] - p[0]
+    dp[-1] = p[-1] - p[-2]
+
+    n = np.linalg.norm(dp, axis=1, keepdims=True) + 1e-12
+    t_hat = dp / n
+    n_hat = np.stack([-t_hat[:, 1], t_hat[:, 0]], axis=1)
+    return t_hat.astype(np.float32), n_hat.astype(np.float32)
+
+def save_kymos(
+    out_dir: str,
+    track_id: int | str,
+    kymo_ncl: np.ndarray,   # (N,C,L)
+    save_float_tif: bool = True,
+    save_png: bool = True,
+    make_rgb: bool = True,
+    png_scale: int = 1,
+    png_bitdepth: int = 8,
+):
+    os.makedirs(out_dir, exist_ok=True)
+    N, C, L = kymo_ncl.shape
+
+    def _scale_for_png(img2d: np.ndarray):
+        vmin = np.nanpercentile(img2d, 1)
+        vmax = np.nanpercentile(img2d, 99)
+        scaled = np.clip((img2d - vmin) / (vmax - vmin + 1e-12), 0, 1)
+        scaled = np.nan_to_num(scaled)
+
+        if png_bitdepth == 16:
+            out = (scaled * 65535).astype(np.uint16)
+        else:
+            out = (scaled * 255).astype(np.uint8)
+
+        if png_scale > 1:
+            out = np.kron(out, np.ones((png_scale, png_scale), dtype=out.dtype))
+
+        return out
+
+    for c in range(C):
+        img = kymo_ncl[:, c, :]  # (N, L)
+
+        if save_float_tif:
+            path_tif = os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.tif")
+            iio.imwrite(path_tif, img.astype(np.float32))
+
+        if save_png:
+            path_png = os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.png")
+            iio.imwrite(path_png, _scale_for_png(img))
+
+    if make_rgb and C >= 2 and save_png:
+        rgb = np.zeros((N, L, 3), dtype=np.uint8)
+        for ch in range(min(C, 3)):
+            vmin = np.nanpercentile(kymo_ncl[:, ch, :], 1)
+            vmax = np.nanpercentile(kymo_ncl[:, ch, :], 99)
+            scaled = np.clip((kymo_ncl[:, ch, :] - vmin) / (vmax - vmin + 1e-12), 0, 1)
+            rgb[..., ch] = (255 * np.nan_to_num(scaled)).astype(np.uint8)
+
+        if png_scale > 1:
+            rgb = np.kron(rgb, np.ones((png_scale, png_scale, 1), dtype=rgb.dtype))
+
+        path_rgb = os.path.join(out_dir, f"track_{track_id}_kymo_rgb.png")
+        iio.imwrite(path_rgb, rgb)
+
+
+def export_all_track_kymographs_from_array(
+    img_array: np.ndarray,
+    tracks_df: pd.DataFrame,
+    out_root: str,
+    image_name: str,
+    L: int = 200,
+    W: int = 9,
+    width_reduce: str = "mean",
+    min_len: int = 3,
+    include_all_frames: bool = False,
+    frame_base: int = 0,
+):
+    validate_tracks_df(tracks_df)
+
+    if img_array.ndim == 3:
+        img_array = img_array[:, None, :, :]
+    if img_array.ndim != 4:
+        raise ValueError(f"Expected (T,C,Y,X) or (T,Y,X), got {img_array.shape}")
+
+    T, C, Y, X = img_array.shape
+    image_root = os.path.splitext(os.path.basename(image_name))[0]
+    out_root_img = os.path.join(out_root, image_root)
+    os.makedirs(out_root_img, exist_ok=True)
+
+    df = tracks_df.copy()
+
+    if "image_name" in df.columns:
+        df["_root"] = df["image_name"].astype(str).apply(
+            lambda s: os.path.splitext(os.path.basename(s))[0]
+        )
+        df = df[df["_root"] == image_root].copy()
+        df = df.drop(columns=["_root"], errors="ignore")
+
+    if df.empty:
+        raise ValueError(f"No tracks found for image '{image_root}'")
+
+    for pid, g in df.groupby("particle", sort=True):
+        g = g.sort_values("frame")
+        if len(g) < min_len:
+            continue
+
+        frames_track = g["frame"].to_numpy(dtype=int) - frame_base
+        xy_track = g[["x", "y"]].to_numpy(dtype=np.float32)
+
+        path_xy = resample_polyline_equal_arclength(xy_track, n_samples=L)
+
+        if include_all_frames:
+            frames_used = np.arange(img_array.shape[0], dtype=int)
+        else:
+            frames_used = frames_track
+
+        kymo = kymograph_along_fixed_path(
+            stack=img_array,
+            frames_0based=frames_used,
+            path_xy=path_xy,
+            width_px=W,
+            width_reduce=width_reduce,
+        )
+
+        out_dir = os.path.join(out_root_img, f"particle_{pid}")
+        save_kymos(
+            out_dir=out_dir,
+            track_id=pid,
+            kymo_ncl=kymo,
+            save_float_tif=True,
+            save_png=True,
+            make_rgb=True,
+            png_scale=3,
+            png_bitdepth=8,
+        )
+
+        meta = g[["frame", "x", "y"]].copy()
+        meta["frame_0based"] = frames_track
+        meta.to_csv(os.path.join(out_dir, f"track_{pid}_meta.csv"), index=False)
+
+        np.savetxt(
+            os.path.join(out_dir, f"track_{pid}_path_xy.csv"),
+            path_xy,
+            delimiter=",",
+            header="x,y",
+            comments="",
+        )
+
+        pd.DataFrame({"frame_0based_used": frames_used}).to_csv(
+            os.path.join(out_dir, f"track_{pid}_kymo_frames_used.csv"),
+            index=False,
+        )
