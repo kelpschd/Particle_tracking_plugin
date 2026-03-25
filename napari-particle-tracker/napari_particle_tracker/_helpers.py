@@ -1,6 +1,103 @@
 # helpers.py
 import numpy as np
 import pandas as pd
+from vispy.color import Colormap
+import os
+
+PT_META_KEY = "particle_tracking"
+
+def pt_meta_dict(**kwargs):
+    return {PT_META_KEY: kwargs}
+
+
+def image_root_from_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    return os.path.splitext(os.path.basename(str(path)))[0]
+
+
+def layer_name(image_root: str | None, channel_label: str | None, role: str) -> str:
+    parts = [image_root, channel_label, role]
+    return " | ".join(str(p) for p in parts if p)
+
+
+def vispy_colormap_from_rgb(rgb, name="channel"):
+    r, g, b = [v / 255.0 for v in rgb]
+    return Colormap([[0, 0, 0, 1], [r, g, b, 1]])
+
+
+def normalize_rgb(color):
+    if color is None:
+        return None
+
+    if hasattr(color, "r") and hasattr(color, "g") and hasattr(color, "b"):
+        vals = [float(color.r), float(color.g), float(color.b)]
+    else:
+        arr = np.asarray(color).reshape(-1)
+        if arr.size < 3:
+            return None
+        vals = [float(arr[0]), float(arr[1]), float(arr[2])]
+
+    if max(vals) <= 1.0:
+        vals = [255.0 * v for v in vals]
+
+    return tuple(int(np.clip(round(v), 0, 255)) for v in vals)
+
+def extract_nd2_channel_info(path: str, nd2_module, fallback_n_channels: int = 1):
+    info = [
+        {
+            "index": i,
+            "name": f"Ch {i}",
+            "label": f"Ch {i}",
+            "rgb": None,
+            "emission_nm": None,
+            "excitation_nm": None,
+        }
+        for i in range(int(fallback_n_channels))
+    ]
+
+    if nd2_module is None:
+        return info
+
+    try:
+        with nd2_module.ND2File(path) as f:
+            channels = list(getattr(getattr(f, "metadata", None), "channels", []) or [])
+            n_channels = max(int(fallback_n_channels), len(channels))
+
+            # grow list if needed
+            if len(info) < n_channels:
+                for i in range(len(info), n_channels):
+                    info.append(
+                        {
+                            "index": i,
+                            "name": f"Ch {i}",
+                            "label": f"Ch {i}",
+                            "rgb": None,
+                            "emission_nm": None,
+                            "excitation_nm": None,
+                        }
+                    )
+
+            for i, ch in enumerate(channels[:n_channels]):
+                meta = getattr(ch, "channel", ch)
+
+                name = getattr(meta, "name", None) or f"Ch {i}"
+                rgb = normalize_rgb(getattr(meta, "color", None))
+
+                info[i].update(
+                    {
+                        "index": i,
+                        "name": str(name),
+                        "label": str(name),
+                        "rgb": rgb,
+                        "emission_nm": getattr(meta, "emissionLambdaNm", None),
+                        "excitation_nm": getattr(meta, "excitationLambdaNm", None),
+                    }
+                )
+    except Exception:
+        pass
+
+    return info
 
 # ======================================================================
 # Helper functions to convert between DataFrame <-> napari Tracks layer
