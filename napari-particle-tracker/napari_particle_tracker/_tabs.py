@@ -155,14 +155,6 @@ def make_plugin_gui(viewer=None, **_):
 
     tabs.addTab(tracks_table_page, "Tracks Table")
 
-    # Visualization placeholder
-    viz_page = QWidget()
-    viz_layout = QVBoxLayout(viz_page)
-    viz_layout.setContentsMargins(0, 0, 0, 0)
-    viz_layout.setSpacing(0)
-    viz_layout.addWidget(Container(widgets=[Label(value="Visualization page coming soon")]).native)
-    tabs.addTab(viz_page, "Visualization")
-
     # Export tab
     export_page = QWidget()
     exp_layout = QVBoxLayout(export_page)

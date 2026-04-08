@@ -383,10 +383,19 @@ def tracking_widget(
         # ensure columns ordering matches napari Tracks: [track_id, t, y, x]
         tracks_df = tracks_df[['particle', 'frame', 'y', 'x']].copy()
         track_data = tracks_df[['particle', 'frame', 'y', 'x']].to_numpy(dtype=float)
-
         props = {"particle": tracks_df["particle"].to_numpy()}
 
-        viewer.add_tracks(
+        run_track_meta = {
+            "max_distance": float(max_distance),
+            "max_missed": int(max_missed),
+            "disp_min_frames": int(disp_min_frames),
+            "disp_threshold": float(disp_threshold),
+            "max_crossings": int(max_crossings),
+            "use_disp_filter": bool(use_disp_filter),
+            "use_intersection_filter": bool(use_intersection_filter),
+        }
+
+        tracks_layer = viewer.add_tracks(
             track_data,
             name="Tracks",
             properties=props,
@@ -394,6 +403,9 @@ def tracking_widget(
             head_length=0,
             blending="translucent",
         )
+        # assign metadata after creation
+        tracks_layer.metadata["run_params"] = run_track_meta
+        
         n_tracks = tracks_df["particle"].nunique()
         show_info(f"Tracking complete: {n_tracks} tracks.")
 

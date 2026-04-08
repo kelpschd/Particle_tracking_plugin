@@ -470,23 +470,38 @@ class ExportWidget(QWidget):
 
             df = self._get_tracks_df()
 
-            spot_meta = {
-                "median_filter_size": particle_detection_widget.median_filter_size.value,
-                "threshold": particle_detection_widget.threshold.value,
-                "min_sigma": particle_detection_widget.min_sigma.value,
-                "max_sigma": particle_detection_widget.max_sigma.value,
-                "enable_density_filter": particle_detection_widget.enable_density_filter.value,
-                "bin_size": particle_detection_widget.bin_size.value,
-                "blob_filter": particle_detection_widget.blob_filter.value,
-            }
+            # --- read params from layer metadata (captured at run-time) ---
+            spot_meta = {}
+            track_meta = {}
 
-            track_meta = {
-                "max_distance": tracking_widget.max_distance.value,
-                "max_missed": tracking_widget.max_missed.value,
-                "disp_min_frames": tracking_widget.disp_min_frames.value,
-                "disp_threshold": tracking_widget.disp_threshold.value,
-                "max_crossings": tracking_widget.max_crossings.value,
-            }
+            # pull from Points layer
+            pts_layers = [
+                ly for ly in self.viewer.layers
+                if ly.__class__.__name__ == "Points"
+                and getattr(ly, "name", "") == "Detected puncta"
+            ]
+            if pts_layers:
+                spot_meta = pts_layers[0].metadata.get("run_params", {})
+            
+            if not spot_meta:
+                show_warning(
+                    "Detection parameters not found in layer metadata. "
+                    "Re-run detection before exporting to ensure accurate metadata."
+                )
+
+            # pull from Tracks layer
+            tracks_layers = [
+                ly for ly in self.viewer.layers
+                if ly.__class__.__name__ == "Tracks"
+            ]
+            if tracks_layers:
+                track_meta = tracks_layers[0].metadata.get("run_params", {})
+
+            if not track_meta:
+                show_warning(
+                    "Tracking parameters not found in layer metadata. "
+                    "Re-run tracking before exporting to ensure accurate metadata."
+                )
 
             image_meta = {
                 "image_name": getattr(self.image_import_widget, "nd2_path", ""),

@@ -204,7 +204,19 @@ def particle_detection_widget(
         if "size" in det_df.columns:
             props["size"] = det_df["size"].to_numpy()
 
-        viewer.add_points(
+        run_spot_meta = {
+            "median_filter_size": int(median_filter_size),
+            "threshold": float(threshold),
+            "min_sigma": float(min_sigma),
+            "max_sigma": float(max_sigma),
+            "enable_density_filter": bool(enable_density_filter),
+            "bin_size": int(bin_size),
+            "blob_filter": int(blob_filter),
+            "n_detected_before_filter": int(n_before),
+            "n_detected_after_filter": int(n_after),
+        }
+
+        pts_layer = viewer.add_points(
             points_data,
             name="Detected puncta",
             size=30,
@@ -213,6 +225,8 @@ def particle_detection_widget(
             border_color="red",
             border_width=0.1,
         )
+        # assign metadata after creation
+        pts_layer.metadata["run_params"] = run_spot_meta
 
         if enable_density_filter:
             show_info(f"Puncta detection complete: {n_after} remain (from {n_before}) after density filter.")
