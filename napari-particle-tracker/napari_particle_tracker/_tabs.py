@@ -1,6 +1,6 @@
 # _tabs.py
 import pandas as pd
-from qtpy.QtWidgets import QWidget, QGridLayout, QVBoxLayout, QTabWidget, QPushButton, QSizePolicy
+from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QPushButton, QLabel
 from magicgui.widgets import Container, Label
 from napari import current_viewer
 from napari.utils.notifications import show_warning
@@ -11,6 +11,7 @@ from ._image_import_widget import ImageImportWidget
 from .tracks_table_widget import TracksTableWidget
 from ._helpers import tracks_layer_to_dataframe, dataframe_to_tracks_layer_data
 from ._export import ExportWidget
+from ._validation_state import get_or_create_validation_state, init_validation_from_tracks
 
 # keep the layer dropdowns fresh
 def _refresh_layer_choices(*_):
@@ -25,6 +26,7 @@ def _refresh_layer_choices(*_):
 
 def make_plugin_gui(viewer=None, **_):
     viewer = viewer or current_viewer()
+    state = get_or_create_validation_state(viewer)
 
     particle_detection_widget.viewer.value = viewer
     tracking_widget.viewer.value = viewer 
@@ -58,115 +60,99 @@ def make_plugin_gui(viewer=None, **_):
     trk_layout.setSpacing(0)
     trk_layout.addWidget(tracking_widget.native)
 
-    # --- Controls to open the dockable TracksListWidget ---
     open_tracks_list_btn = QPushButton("Open Tracks List")
-    open_tracks_list_btn.setToolTip("Open a docked list of tracks (select a track to zoom/preview).")
+    open_tracks_list_btn.setToolTip(
+        "Open the validation queue (pending tracks) as a docked panel."
+    )
     trk_layout.addWidget(open_tracks_list_btn)
-
     trk_layout.addStretch(1)
     tabs.addTab(tracking_page, "Tracking")
 
-    # Find first Tracks layer and return (layer, dataframe) !move to helpers
-    def _get_first_tracks_layer_and_df():
-        tracks_layers = [ly for ly in viewer.layers if ly.__class__.__name__ == "Tracks"]
-        if not tracks_layers:
-            return None, None
-        layer = tracks_layers[0]
-        df = tracks_layer_to_dataframe(layer)
-        return layer, df
+    # Validated tracks page
+    validated_page = QWidget()
+    val_layout = QVBoxLayout(validated_page)
+    val_layout.setContentsMargins(0, 0, 0, 0)
+    val_layout.setSpacing(0)
+    val_layout.addWidget(QLabel("Validated (kept) tracks"))
 
-    # keep a single persistent tracks list on viewer.window !move to helpers
-    def _open_tracks_list_singleton():
-        # reuse if exists
-        existing = getattr(viewer.window, "_tracks_list_widget", None)
-        if existing is not None:
-            # refresh its contents
-            layer, df = _get_first_tracks_layer_and_df()
-            if df is None or df.empty:
-                show_warning("No Tracks layer found to populate the list.")
-                return
-            existing.set_tracks(df)
-            return
-
-        layer, df = _get_first_tracks_layer_and_df()
-        if layer is None or df is None or df.empty:
-            show_warning("No Tracks layer found to populate the list.")
-            return
-
-        widget = TracksListWidget(viewer=viewer, tracks_df=df)
-        viewer.window.add_dock_widget(widget, name="Tracks List", area="right")
-        viewer.window._tracks_list_widget = widget
-
-    open_tracks_list_btn.clicked.connect(_open_tracks_list_singleton)
-
-    # refresh when layers are added/removed/renamed
-    viewer.layers.events.inserted.connect(_refresh_layer_choices)
-    viewer.layers.events.removed.connect(_refresh_layer_choices)
-    viewer.layers.events.reordered.connect(_refresh_layer_choices)
-    viewer.layers.events.changed.connect(_refresh_layer_choices)
-
-    # also refresh once on startup
-    _refresh_layer_choices()
-
-    # ------------------------------------------------------------------
-    # Tracks Table page
-    # ------------------------------------------------------------------
-    tracks_table_page = QWidget()
-    ttable_layout = QVBoxLayout(tracks_table_page)
-    ttable_layout.setContentsMargins(0, 0, 0, 0)
-    ttable_layout.setSpacing(0)
-
-    # Button to link to current Tracks layer
-    link_btn = QPushButton("Load table from active Tracks layer")
-    ttable_layout.addWidget(link_btn)
-
-    # Start with an empty dataframe and no layer
-    empty_df = pd.DataFrame()
-    dummy_layer = None
-
-    tracks_table_widget = TracksTableWidget(
+    state = get_or_create_validation_state(viewer) 
+    validated_table = TracksTableWidget(
         viewer=viewer,
-        tracks_layer=dummy_layer,
-        tracks_df=empty_df,
+        tracks_layer=None,
+        tracks_df=state.kept_df,
     )
-    ttable_layout.addWidget(tracks_table_widget)
-
-    def _link_tracks_table():
-        """Bind the table to the first Tracks layer, if one exists."""
-        tracks_layers = [ly for ly in viewer.layers if ly.__class__.__name__ == "Tracks"]
-        if not tracks_layers:
-            # You can comment this out if the warning gets annoying on startup
-            show_warning("No Tracks layer found.")
-            return
-
-        layer = tracks_layers[0]
-        df = tracks_layer_to_dataframe(layer)
-
-        tracks_table_widget.tracks_layer = layer
-        # depending on your TracksTableWidget API you might need to call a setter or method;
-        # you currently set .dataframe property in other code, so keep that usage:
-        tracks_table_widget.dataframe = df
-
-    # Button triggers reload from active Tracks layer
-    link_btn.clicked.connect(_link_tracks_table)
-
-    # Optional: auto-load if there's already a Tracks layer when the plugin opens
-    _link_tracks_table()
-
-    tabs.addTab(tracks_table_page, "Tracks Table")
+    val_layout.addWidget(validated_table)
+    tabs.addTab(validated_page, "Validated Tracks")
 
     # Export tab
     export_page = QWidget()
     exp_layout = QVBoxLayout(export_page)
     exp_layout.setContentsMargins(0, 0, 0, 0)
     exp_layout.setSpacing(0)
-
     export_widget = ExportWidget(
         viewer=viewer,
         image_import_widget=import_widget,
-        tracks_table_widget=tracks_table_widget,
     )
     exp_layout.addWidget(export_widget)
     tabs.addTab(export_page, "Export")
+
+    def _open_tracks_list_singleton():
+        state = get_or_create_validation_state(viewer)
+        if state.is_empty:
+            tracks_layers = [
+                ly for ly in viewer.layers
+                if ly.__class__.__name__ == "Tracks"
+            ]
+            if not tracks_layers:
+                show_warning("Run tracking first to populate the validation queue.")
+                return
+            df = tracks_layer_to_dataframe(tracks_layers[0])
+            init_validation_from_tracks(viewer, df)
+        try:
+            qt_win = viewer.window._qt_window
+        except Exception:
+            qt_win = viewer.window
+        existing = getattr(qt_win, "_tracks_list_widget", None)
+        widget_alive = (
+            existing is not None
+            and hasattr(existing, "isVisible")
+            and existing.isVisible()
+        )
+        if widget_alive:
+            existing.refresh_from_state()
+            return
+        widget = TracksListWidget(viewer=viewer)
+        viewer.window.add_dock_widget(widget, name="Tracks List", area="right")
+        setattr(qt_win, "_tracks_list_widget", widget)
+        widget.track_kept.connect(
+            lambda: validated_table.__setattr__(
+                "dataframe", get_or_create_validation_state(viewer).kept_df
+            )
+        )
+
+    open_tracks_list_btn.clicked.connect(_open_tracks_list_singleton)
+
+    def _on_layer_inserted(event):
+        layer = event.value
+        if layer.__class__.__name__ == "Tracks":
+            state = get_or_create_validation_state(viewer)
+            if state.is_empty:
+                df = tracks_layer_to_dataframe(layer)
+                init_validation_from_tracks(viewer, df)
+            try:
+                existing = viewer.window._qt_window._tracks_list_widget
+            except Exception:
+                existing = getattr(getattr(viewer.window, "_qt_window", viewer.window),
+                                   "_tracks_list_widget", None)
+            if existing is not None and hasattr(existing, "isVisible") and existing.isVisible():
+                existing.refresh_from_state()
+
+    viewer.layers.events.inserted.connect(_on_layer_inserted)
+    viewer.layers.events.inserted.connect(_refresh_layer_choices)
+    viewer.layers.events.removed.connect(_refresh_layer_choices)
+    viewer.layers.events.reordered.connect(_refresh_layer_choices)
+    viewer.layers.events.changed.connect(_refresh_layer_choices)
+
+    _refresh_layer_choices()
 
     return tabs

@@ -8,33 +8,27 @@ from PIL import Image, ImageDraw
 
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox
+    QFileDialog, QLineEdit, QCheckBox, QSpinBox, QGroupBox
 )
 from napari.utils.notifications import show_info, show_warning, show_error
+
+from ._validation_state import get_validation_state
 from ._widget import particle_detection_widget
-from ._tracking_widget import tracking_widget
 
 def add_export_metadata(df: pd.DataFrame, spot_meta=None, track_meta=None, image_meta=None):
     out = df.copy()
-
-    spot_meta = spot_meta or {}
-    track_meta = track_meta or {}
-    image_meta = image_meta or {}
-
-    # repeat scalar metadata on every row
-    for prefix, meta in [("spot", spot_meta), ("track", track_meta), ("image", image_meta)]:
+    for prefix, meta in [
+        ("spot",  spot_meta  or {}),
+        ("track", track_meta or {}),
+        ("image", image_meta or {}),
+    ]:
         for key, value in meta.items():
             col = f"{prefix}_{key}"
             if np.isscalar(value) or isinstance(value, str):
                 out[col] = value
             else:
-                # if it's already per-row, keep it only if lengths match
                 value = np.asarray(value)
-                if len(value) == len(out):
-                    out[col] = value
-                else:
-                    out[col] = np.nan
-
+                out[col] = value if len(value) == len(out) else np.nan
     return out
 
 def normalize_crop_percentile(crop, lower=2, upper=98):
@@ -106,6 +100,37 @@ def _resize_nn(rgb_u8, scale):
     im = im.resize((w * scale, h * scale), resample=Image.Resampling.NEAREST)
     return np.array(im, dtype=np.uint8)
 
+def validate_tracks_df(tracks_df: pd.DataFrame) -> None:
+    required = {"frame", "x", "y", "particle"}
+    missing = required - set(tracks_df.columns)
+    if missing:
+        raise ValueError(f"tracks_df missing columns: {missing}")
+
+# ======================================================================
+# CSV helpers
+# ======================================================================
+
+def _collect_layer_meta(viewer):
+    """Pull run_params from Points and Tracks layers stored at run-time."""
+    spot_meta = {}
+    track_meta = {}
+
+    pts_layers = [
+        ly for ly in viewer.layers
+        if ly.__class__.__name__ == "Points"
+        and getattr(ly, "name", "") == "Detected puncta"
+    ]
+    if pts_layers:
+        spot_meta = pts_layers[0].metadata.get("run_params", {})
+
+    trk_layers = [
+        ly for ly in viewer.layers
+        if ly.__class__.__name__ == "Tracks"
+    ]
+    if trk_layers:
+        track_meta = trk_layers[0].metadata.get("run_params", {})
+
+    return spot_meta, track_meta
 
 def save_tracks_csv(
     tracks_df: pd.DataFrame,
@@ -351,251 +376,35 @@ def save_track_gifs(
         iio.imwrite(fn_ann, comp_ann, duration=duration, loop=0)
         print(f"Saved gifs for track {pid}")
 
-class ExportWidget(QWidget):
-    def __init__(self, viewer, image_import_widget, tracks_table_widget, parent=None):
-        super().__init__(parent)
-        self.viewer = viewer
-        self.image_import_widget = image_import_widget
-        self.tracks_table_widget = tracks_table_widget
-        self._build_ui()
+def resample_polyline_equal_arclength(xy: np.ndarray, n_samples: int) -> np.ndarray:
+    xy = np.asarray(xy, dtype=np.float32)
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise ValueError("xy must be (N,2)")
+    if xy.shape[0] < 2:
+        return np.repeat(xy[:1], n_samples, axis=0)
+    seg = xy[1:] - xy[:-1]
+    d = np.sqrt((seg ** 2).sum(axis=1))
+    s = np.concatenate([[0.0], np.cumsum(d)])
+    total = float(s[-1])
+    if total < 1e-6:
+        return np.repeat(xy[:1], n_samples, axis=0)
+    s_new = np.linspace(0, total, n_samples, dtype=np.float32)
+    return np.stack([np.interp(s_new, s, xy[:, 0]),
+                     np.interp(s_new, s, xy[:, 1])], axis=1).astype(np.float32)
 
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
+def tangents_and_normals_from_path(path_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    p = np.asarray(path_xy, dtype=np.float32)
+    if p.ndim != 2 or p.shape[1] != 2:
+        raise ValueError("path_xy must be (L,2) in (x,y)")
+    dp = np.zeros_like(p)
+    dp[1:-1] = p[2:] - p[:-2]
+    dp[0] = p[1] - p[0]
+    dp[-1] = p[-1] - p[-2]
+    n = np.linalg.norm(dp, axis=1, keepdims=True) + 1e-12
+    t_hat = dp / n
+    n_hat = np.stack([-t_hat[:, 1], t_hat[:, 0]], axis=1)
+    return t_hat.astype(np.float32), n_hat.astype(np.float32)
 
-        layout.addWidget(QLabel("Export validated tracks"))
-
-        self.csv_path = QLineEdit()
-        csv_btn = QPushButton("Browse CSV...")
-        csv_btn.clicked.connect(self._pick_csv)
-        row1 = QHBoxLayout()
-        row1.addWidget(self.csv_path)
-        row1.addWidget(csv_btn)
-        layout.addLayout(row1)
-
-        self.movie_dir = QLineEdit()
-        movie_btn = QPushButton("Browse movie folder...")
-        movie_btn.clicked.connect(self._pick_movie_dir)
-        row2 = QHBoxLayout()
-        row2.addWidget(self.movie_dir)
-        row2.addWidget(movie_btn)
-        layout.addLayout(row2)
-
-        self.save_csv_btn = QPushButton("Save validated tracks CSV")
-        self.save_csv_btn.clicked.connect(self._save_csv)
-        layout.addWidget(self.save_csv_btn)
-
-        self.save_mp4_btn = QPushButton("Export MP4 movies")
-        self.save_mp4_btn.clicked.connect(self._save_mp4)
-        layout.addWidget(self.save_mp4_btn)
-
-        self.save_gif_btn = QPushButton("Export GIFs")
-        self.save_gif_btn.clicked.connect(self._save_gif)
-        layout.addWidget(self.save_gif_btn)
-
-        self.padding = QSpinBox()
-        self.padding.setRange(0, 1000)
-        self.padding.setValue(40)
-
-        self.fps = QSpinBox()
-        self.fps.setRange(1, 120)
-        self.fps.setValue(10)
-
-        self.upscale = QSpinBox()
-        self.upscale.setRange(1, 10)
-        self.upscale.setValue(2)
-
-        self.only_track_frames = QCheckBox("Only frames where track exists")
-        self.only_track_frames.setChecked(True)
-
-        self.annotate = QCheckBox("Include overlays")
-        self.annotate.setChecked(True)
-
-        self.save_kymo_btn = QPushButton("Export kymographs")
-        self.save_kymo_btn.clicked.connect(self._save_kymographs)
-        layout.addWidget(self.save_kymo_btn)
-
-        layout.addWidget(QLabel("Padding"))
-        layout.addWidget(self.padding)
-        layout.addWidget(QLabel("FPS"))
-        layout.addWidget(self.fps)
-        layout.addWidget(QLabel("Upscale"))
-        layout.addWidget(self.upscale)
-        layout.addWidget(self.only_track_frames)
-        layout.addWidget(self.annotate)
-
-        layout.addStretch(1)
-
-    def _pick_csv(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV (*.csv)")
-        if path:
-            self.csv_path.setText(path)
-
-    def _pick_movie_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "Select output directory")
-        if path:
-            self.movie_dir.setText(path)
-
-    def _get_tracks_df(self):
-        # 1) Prefer whatever is currently in the table widget
-        df = self.tracks_table_widget.dataframe
-        if df is not None and not df.empty:
-            return df
-
-        # 2) Fallback: try the active Tracks layer
-        for ly in self.viewer.layers:
-            if ly.__class__.__name__ == "Tracks":
-                try:
-                    from ._helpers import tracks_layer_to_dataframe
-                    df = tracks_layer_to_dataframe(ly)
-                    if df is not None and not df.empty:
-                        # keep the table in sync for next time
-                        self.tracks_table_widget.dataframe = df
-                        return df
-                except Exception:
-                    pass
-
-        raise ValueError("No tracks loaded in the table.")
-
-    def _get_image_array(self):
-        arr = getattr(self.image_import_widget, "_cached_array", None)
-        if arr is None:
-            raise ValueError("No imported image stack available.")
-        return arr
-
-    def _save_csv(self):
-        try:
-            out_path = self.csv_path.text().strip()
-            if not out_path:
-                raise ValueError("Choose a CSV output path first.")
-
-            df = self._get_tracks_df()
-
-            # --- read params from layer metadata (captured at run-time) ---
-            spot_meta = {}
-            track_meta = {}
-
-            # pull from Points layer
-            pts_layers = [
-                ly for ly in self.viewer.layers
-                if ly.__class__.__name__ == "Points"
-                and getattr(ly, "name", "") == "Detected puncta"
-            ]
-            if pts_layers:
-                spot_meta = pts_layers[0].metadata.get("run_params", {})
-            
-            if not spot_meta:
-                show_warning(
-                    "Detection parameters not found in layer metadata. "
-                    "Re-run detection before exporting to ensure accurate metadata."
-                )
-
-            # pull from Tracks layer
-            tracks_layers = [
-                ly for ly in self.viewer.layers
-                if ly.__class__.__name__ == "Tracks"
-            ]
-            if tracks_layers:
-                track_meta = tracks_layers[0].metadata.get("run_params", {})
-
-            if not track_meta:
-                show_warning(
-                    "Tracking parameters not found in layer metadata. "
-                    "Re-run tracking before exporting to ensure accurate metadata."
-                )
-
-            image_meta = {
-                "image_name": getattr(self.image_import_widget, "nd2_path", ""),
-            }
-
-            save_tracks_csv(
-                df,
-                out_path,
-                spot_meta=spot_meta,
-                track_meta=track_meta,
-                image_meta=image_meta,
-                add_metadata=self.annotate.isChecked(),
-            )
-            show_info(f"Saved CSV: {out_path}")
-        except Exception as e:
-            show_error(str(e))
-
-    def _save_mp4(self):
-        try:
-            out_dir = self.movie_dir.text().strip()
-            if not out_dir:
-                raise ValueError("Choose an output directory first.")
-            df = self._get_tracks_df()
-            arr = self._get_image_array()
-            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
-
-            save_track_movies_mp4(
-                img_array=arr,
-                track_df=df,
-                image_name=image_name,
-                output_dir=out_dir,
-                padding=self.padding.value(),
-                fps=self.fps.value(),
-                upscale=self.upscale.value(),
-                only_track_frames=self.only_track_frames.isChecked(),
-            )
-            show_info("MP4 export complete.")
-        except Exception as e:
-            show_error(str(e))
-
-    def _save_gif(self):
-        try:
-            out_dir = self.movie_dir.text().strip()
-            if not out_dir:
-                raise ValueError("Choose an output directory first.")
-            df = self._get_tracks_df()
-            arr = self._get_image_array()
-            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
-
-            save_track_gifs(
-                img_array=arr,
-                track_df=df,
-                image_name=image_name,
-                output_dir=out_dir,
-                padding=self.padding.value(),
-                fps=self.fps.value(),
-                upscale=self.upscale.value(),
-                only_track_frames=self.only_track_frames.isChecked(),
-            )
-            show_info("GIF export complete.")
-        except Exception as e:
-            show_error(str(e))
-
-    def _save_kymographs(self):
-        try:
-            out_dir = self.movie_dir.text().strip()
-            if not out_dir:
-                raise ValueError("Choose an output directory first.")
-
-            df = self._get_tracks_df()
-            arr = self._get_image_array()
-            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
-
-            export_all_track_kymographs_from_array(
-                img_array=arr,
-                tracks_df=df,
-                out_root=out_dir,
-                image_name=image_name,
-                L=200,
-                W=9,
-                width_reduce="mean",
-                include_all_frames=False,
-                frame_base=0,
-            )
-            show_info("Kymograph export complete.")
-        except Exception as e:
-            show_error(str(e))
-
-def validate_tracks_df(tracks_df: pd.DataFrame) -> None:
-    required = {"frame", "x", "y", "particle"}
-    missing = required - set(tracks_df.columns)
-    if missing:
-        raise ValueError(f"tracks_df missing columns: {missing}")
-    
 def kymograph_along_fixed_path(
     stack: np.ndarray,          # (T, C, Y, X) or (T, Y, X)
     frames_0based: np.ndarray,  # (N,)
@@ -656,82 +465,28 @@ def kymograph_along_fixed_path(
 
     return kymo
 
-def resample_polyline_equal_arclength(xy: np.ndarray, n_samples: int) -> np.ndarray:
-    xy = np.asarray(xy, dtype=np.float32)
-    if xy.ndim != 2 or xy.shape[1] != 2:
-        raise ValueError("xy must be (N,2) in (x,y)")
-
-    if xy.shape[0] < 2:
-        return np.repeat(xy[:1], n_samples, axis=0)
-
-    seg = xy[1:] - xy[:-1]
-    d = np.sqrt((seg ** 2).sum(axis=1))
-    s = np.concatenate([[0.0], np.cumsum(d)])
-    total = float(s[-1])
-
-    if total < 1e-6:
-        return np.repeat(xy[:1], n_samples, axis=0)
-
-    s_new = np.linspace(0, total, n_samples, dtype=np.float32)
-    x_new = np.interp(s_new, s, xy[:, 0])
-    y_new = np.interp(s_new, s, xy[:, 1])
-
-    return np.stack([x_new, y_new], axis=1).astype(np.float32)
-
-def tangents_and_normals_from_path(path_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    p = np.asarray(path_xy, dtype=np.float32)
-    if p.ndim != 2 or p.shape[1] != 2:
-        raise ValueError("path_xy must be (L,2) in (x,y)")
-
-    dp = np.zeros_like(p)
-    dp[1:-1] = p[2:] - p[:-2]
-    dp[0] = p[1] - p[0]
-    dp[-1] = p[-1] - p[-2]
-
-    n = np.linalg.norm(dp, axis=1, keepdims=True) + 1e-12
-    t_hat = dp / n
-    n_hat = np.stack([-t_hat[:, 1], t_hat[:, 0]], axis=1)
-    return t_hat.astype(np.float32), n_hat.astype(np.float32)
-
-def save_kymos(
-    out_dir: str,
-    track_id: int | str,
-    kymo_ncl: np.ndarray,   # (N,C,L)
-    save_float_tif: bool = True,
-    save_png: bool = True,
-    make_rgb: bool = True,
-    png_scale: int = 1,
-    png_bitdepth: int = 8,
-):
+def save_kymos(out_dir, track_id, kymo_ncl, save_float_tif=True,
+               save_png=True, make_rgb=True, png_scale=1, png_bitdepth=8):
     os.makedirs(out_dir, exist_ok=True)
     N, C, L = kymo_ncl.shape
 
-    def _scale_for_png(img2d: np.ndarray):
-        vmin = np.nanpercentile(img2d, 1)
-        vmax = np.nanpercentile(img2d, 99)
+    def _scale(img2d):
+        vmin, vmax = np.nanpercentile(img2d, 1), np.nanpercentile(img2d, 99)
         scaled = np.clip((img2d - vmin) / (vmax - vmin + 1e-12), 0, 1)
         scaled = np.nan_to_num(scaled)
-
-        if png_bitdepth == 16:
-            out = (scaled * 65535).astype(np.uint16)
-        else:
-            out = (scaled * 255).astype(np.uint8)
-
+        out = (scaled * (65535 if png_bitdepth == 16 else 255)).astype(
+            np.uint16 if png_bitdepth == 16 else np.uint8)
         if png_scale > 1:
             out = np.kron(out, np.ones((png_scale, png_scale), dtype=out.dtype))
-
         return out
 
     for c in range(C):
-        img = kymo_ncl[:, c, :]  # (N, L)
-
+        img = kymo_ncl[:, c, :]
         if save_float_tif:
-            path_tif = os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.tif")
-            iio.imwrite(path_tif, img.astype(np.float32))
-
+            iio.imwrite(os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.tif"),
+                        img.astype(np.float32))
         if save_png:
-            path_png = os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.png")
-            iio.imwrite(path_png, _scale_for_png(img))
+            iio.imwrite(os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.png"), _scale(img))
 
     if make_rgb and C >= 2 and save_png:
         rgb = np.zeros((N, L, 3), dtype=np.uint8)
@@ -740,47 +495,28 @@ def save_kymos(
             vmax = np.nanpercentile(kymo_ncl[:, ch, :], 99)
             scaled = np.clip((kymo_ncl[:, ch, :] - vmin) / (vmax - vmin + 1e-12), 0, 1)
             rgb[..., ch] = (255 * np.nan_to_num(scaled)).astype(np.uint8)
-
         if png_scale > 1:
             rgb = np.kron(rgb, np.ones((png_scale, png_scale, 1), dtype=rgb.dtype))
-
-        path_rgb = os.path.join(out_dir, f"track_{track_id}_kymo_rgb.png")
-        iio.imwrite(path_rgb, rgb)
-
+        iio.imwrite(os.path.join(out_dir, f"track_{track_id}_kymo_rgb.png"), rgb)
 
 def export_all_track_kymographs_from_array(
-    img_array: np.ndarray,
-    tracks_df: pd.DataFrame,
-    out_root: str,
-    image_name: str,
-    L: int = 200,
-    W: int = 9,
-    width_reduce: str = "mean",
-    min_len: int = 3,
-    include_all_frames: bool = False,
-    frame_base: int = 0,
+    img_array, tracks_df, out_root, image_name,
+    L=200, W=9, width_reduce="mean", min_len=3,
+    include_all_frames=False, frame_base=0,
 ):
     validate_tracks_df(tracks_df)
-
     if img_array.ndim == 3:
         img_array = img_array[:, None, :, :]
-    if img_array.ndim != 4:
-        raise ValueError(f"Expected (T,C,Y,X) or (T,Y,X), got {img_array.shape}")
-
     T, C, Y, X = img_array.shape
     image_root = os.path.splitext(os.path.basename(image_name))[0]
     out_root_img = os.path.join(out_root, image_root)
     os.makedirs(out_root_img, exist_ok=True)
 
     df = tracks_df.copy()
-
     if "image_name" in df.columns:
         df["_root"] = df["image_name"].astype(str).apply(
-            lambda s: os.path.splitext(os.path.basename(s))[0]
-        )
-        df = df[df["_root"] == image_root].copy()
-        df = df.drop(columns=["_root"], errors="ignore")
-
+            lambda s: os.path.splitext(os.path.basename(s))[0])
+        df = df[df["_root"] == image_root].drop(columns=["_root"], errors="ignore")
     if df.empty:
         raise ValueError(f"No tracks found for image '{image_root}'")
 
@@ -788,50 +524,269 @@ def export_all_track_kymographs_from_array(
         g = g.sort_values("frame")
         if len(g) < min_len:
             continue
-
         frames_track = g["frame"].to_numpy(dtype=int) - frame_base
         xy_track = g[["x", "y"]].to_numpy(dtype=np.float32)
-
         path_xy = resample_polyline_equal_arclength(xy_track, n_samples=L)
-
-        if include_all_frames:
-            frames_used = np.arange(img_array.shape[0], dtype=int)
-        else:
-            frames_used = frames_track
-
+        frames_used = np.arange(img_array.shape[0], dtype=int) if include_all_frames else frames_track
         kymo = kymograph_along_fixed_path(
-            stack=img_array,
-            frames_0based=frames_used,
-            path_xy=path_xy,
-            width_px=W,
-            width_reduce=width_reduce,
+            stack=img_array, frames_0based=frames_used,
+            path_xy=path_xy, width_px=W, width_reduce=width_reduce,
         )
-
         out_dir = os.path.join(out_root_img, f"particle_{pid}")
-        save_kymos(
-            out_dir=out_dir,
-            track_id=pid,
-            kymo_ncl=kymo,
-            save_float_tif=True,
-            save_png=True,
-            make_rgb=True,
-            png_scale=3,
-            png_bitdepth=8,
-        )
-
+        save_kymos(out_dir=out_dir, track_id=pid, kymo_ncl=kymo,
+                   save_float_tif=True, save_png=True, make_rgb=True,
+                   png_scale=3, png_bitdepth=8)
         meta = g[["frame", "x", "y"]].copy()
         meta["frame_0based"] = frames_track
         meta.to_csv(os.path.join(out_dir, f"track_{pid}_meta.csv"), index=False)
-
-        np.savetxt(
-            os.path.join(out_dir, f"track_{pid}_path_xy.csv"),
-            path_xy,
-            delimiter=",",
-            header="x,y",
-            comments="",
-        )
-
+        np.savetxt(os.path.join(out_dir, f"track_{pid}_path_xy.csv"),
+                   path_xy, delimiter=",", header="x,y", comments="")
         pd.DataFrame({"frame_0based_used": frames_used}).to_csv(
-            os.path.join(out_dir, f"track_{pid}_kymo_frames_used.csv"),
-            index=False,
+            os.path.join(out_dir, f"track_{pid}_kymo_frames_used.csv"), index=False)
+
+# ======================================================================
+# Export Widget
+# ======================================================================
+
+class ExportWidget(QWidget):
+    def __init__(self, viewer, image_import_widget, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self.image_import_widget = image_import_widget
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # CSV export group
+        csv_group = QGroupBox("CSV Export")
+        csv_layout = QVBoxLayout(csv_group)
+
+        # Path picker
+        row1 = QHBoxLayout()
+        self.csv_path = QLineEdit()
+        self.csv_path.setPlaceholderText("Output CSV path...")
+        csv_btn = QPushButton("Browse...")
+        csv_btn.clicked.connect(self._pick_csv)
+        row1.addWidget(self.csv_path)
+        row1.addWidget(csv_btn)
+        csv_layout.addLayout(row1)
+
+        # Two export buttons
+        self.save_validated_btn = QPushButton("Export validated tracks CSV")
+        self.save_validated_btn.setToolTip(
+            "Saves only kept tracks — clean ground truth, no status column."
         )
+        self.save_validated_btn.clicked.connect(self._save_validated_csv)
+        csv_layout.addWidget(self.save_validated_btn)
+
+        self.save_all_btn = QPushButton("Export all tracks with flags")
+        self.save_all_btn.setToolTip(
+            "Saves kept + deleted + pending tracks, each row has a 'status' column."
+        )
+        self.save_all_btn.clicked.connect(self._save_all_csv)
+        csv_layout.addWidget(self.save_all_btn)
+
+        layout.addWidget(csv_group)
+
+        # Movie / GIF export group
+        movie_group = QGroupBox("Movie / GIF Export")
+        movie_layout = QVBoxLayout(movie_group)
+
+        row2 = QHBoxLayout()
+        self.movie_dir = QLineEdit()
+        self.movie_dir.setPlaceholderText("Output folder...")
+        movie_btn = QPushButton("Browse...")
+        movie_btn.clicked.connect(self._pick_movie_dir)
+        row2.addWidget(self.movie_dir)
+        row2.addWidget(movie_btn)
+        movie_layout.addLayout(row2)
+
+        self.save_mp4_btn = QPushButton("Export MP4 movies")
+        self.save_mp4_btn.clicked.connect(self._save_mp4)
+        movie_layout.addWidget(self.save_mp4_btn)
+
+        self.save_gif_btn = QPushButton("Export GIFs")
+        self.save_gif_btn.clicked.connect(self._save_gif)
+        movie_layout.addWidget(self.save_gif_btn)
+
+        self.save_kymo_btn = QPushButton("Export kymographs")
+        self.save_kymo_btn.clicked.connect(self._save_kymographs)
+        movie_layout.addWidget(self.save_kymo_btn)
+
+        # Settings
+        self.padding = QSpinBox(); self.padding.setRange(0, 1000); self.padding.setValue(40)
+        self.fps = QSpinBox(); self.fps.setRange(1, 120); self.fps.setValue(10)
+        self.upscale = QSpinBox(); self.upscale.setRange(1, 10); self.upscale.setValue(2)
+        self.only_track_frames = QCheckBox("Only frames where track exists")
+        self.only_track_frames.setChecked(True)
+
+        movie_layout.addWidget(QLabel("Padding")); movie_layout.addWidget(self.padding)
+        movie_layout.addWidget(QLabel("FPS"));     movie_layout.addWidget(self.fps)
+        movie_layout.addWidget(QLabel("Upscale")); movie_layout.addWidget(self.upscale)
+        movie_layout.addWidget(self.only_track_frames)
+
+        layout.addWidget(movie_group)
+        layout.addStretch(1)
+
+    def _pick_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV (*.csv)")
+        if path:
+            self.csv_path.setText(path)
+
+    def _pick_movie_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "Select output directory")
+        if path:
+            self.movie_dir.setText(path)
+
+    def _get_state(self):
+        state = get_validation_state(self.viewer)
+        if state is None or state.is_empty:
+            raise ValueError(
+                "No validation data found. Run tracking and validate at least one track first."
+            )
+        return state
+
+    def _get_image_array(self):
+        arr = getattr(self.image_import_widget, "_cached_array", None)
+        if arr is None:
+            raise ValueError("No imported image stack available.")
+        return arr
+
+    def _get_shared_meta(self):
+        spot_meta, track_meta = _collect_layer_meta(self.viewer)
+        if not spot_meta:
+            show_warning(
+                "Detection parameters not found — re-run detection before exporting "
+                "to ensure accurate metadata."
+            )
+        if not track_meta:
+            show_warning(
+                "Tracking parameters not found — re-run tracking before exporting "
+                "to ensure accurate metadata."
+            )
+        image_meta = {"image_name": getattr(self.image_import_widget, "nd2_path", "")}
+        return spot_meta, track_meta, image_meta
+
+    def _require_csv_path(self):
+        path = self.csv_path.text().strip()
+        if not path:
+            raise ValueError("Choose a CSV output path first.")
+        return path
+
+    def _require_movie_dir(self):
+        d = self.movie_dir.text().strip()
+        if not d:
+            raise ValueError("Choose an output directory first.")
+        return d
+
+    def _save_validated_csv(self):
+        """Export only kept tracks — clean ground truth, no status column."""
+        try:
+            out_path = self._require_csv_path()
+            state = self._get_state()
+
+            if state.kept_df.empty:
+                raise ValueError(
+                    "No kept tracks yet. Use the Tracks List to keep tracks before exporting."
+                )
+
+            spot_meta, track_meta, image_meta = self._get_shared_meta()
+            save_tracks_csv(
+                state.validated_df(),
+                out_path,
+                spot_meta=spot_meta,
+                track_meta=track_meta,
+                image_meta=image_meta,
+                add_metadata=True,
+            )
+            show_info(
+                f"Saved validated CSV: {out_path}  "
+                f"({state.n_kept} tracks)"
+            )
+        except Exception as e:
+            show_error(str(e))
+
+    def _save_all_csv(self):
+        """Export all tracks with a 'status' column (kept / deleted / pending)."""
+        try:
+            out_path = self._require_csv_path()
+            state = self._get_state()
+
+            spot_meta, track_meta, image_meta = self._get_shared_meta()
+            all_df = state.all_tracks_df()
+
+            if all_df.empty:
+                raise ValueError("No tracks available to export.")
+
+            save_tracks_csv(
+                all_df,
+                out_path,
+                spot_meta=spot_meta,
+                track_meta=track_meta,
+                image_meta=image_meta,
+                add_metadata=True,
+            )
+            show_info(
+                f"Saved all-tracks CSV: {out_path}  "
+                f"(kept={state.n_kept}, deleted={state.n_deleted}, "
+                f"pending={state.n_pending})"
+            )
+        except Exception as e:
+            show_error(str(e))
+
+    def _get_export_df(self):
+        """Returns kept tracks for movie/gif/kymo export."""
+        state = self._get_state()
+        if state.kept_df.empty:
+            raise ValueError(
+                "No kept tracks yet. Validate tracks before exporting movies."
+            )
+        return state.validated_df()
+
+    def _save_mp4(self):
+        try:
+            out_dir = self._require_movie_dir()
+            df = self._get_export_df()
+            arr = self._get_image_array()
+            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
+            save_track_movies_mp4(
+                img_array=arr, track_df=df, image_name=image_name,
+                output_dir=out_dir, padding=self.padding.value(),
+                fps=self.fps.value(), upscale=self.upscale.value(),
+                only_track_frames=self.only_track_frames.isChecked(),
+            )
+            show_info("MP4 export complete.")
+        except Exception as e:
+            show_error(str(e))
+
+    def _save_gif(self):
+        try:
+            out_dir = self._require_movie_dir()
+            df = self._get_export_df()
+            arr = self._get_image_array()
+            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
+            save_track_gifs(
+                img_array=arr, track_df=df, image_name=image_name,
+                output_dir=out_dir, padding=self.padding.value(),
+                fps=self.fps.value(), upscale=self.upscale.value(),
+                only_track_frames=self.only_track_frames.isChecked(),
+            )
+            show_info("GIF export complete.")
+        except Exception as e:
+            show_error(str(e))
+
+    def _save_kymographs(self):
+        try:
+            out_dir = self._require_movie_dir()
+            df = self._get_export_df()
+            arr = self._get_image_array()
+            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
+            export_all_track_kymographs_from_array(
+                img_array=arr, tracks_df=df, out_root=out_dir,
+                image_name=image_name, L=200, W=9,
+                width_reduce="mean", include_all_frames=False, frame_base=0,
+            )
+            show_info("Kymograph export complete.")
+        except Exception as e:
+            show_error(str(e))  
