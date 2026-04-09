@@ -14,6 +14,7 @@ from ._processing import (
     detect_puncta_dask,
     filter_dense_blobs
 )
+from ._helpers import pt_meta_dict, layer_name, image_root_from_path
 
 def _get_active_image_layer_data(viewer):
     if viewer is None:
@@ -165,7 +166,27 @@ def particle_detection_widget(
         return
 
     if show_preprocessed:
-        viewer.add_image(pre, name="Pre-processed images", rgb=False)
+        active_layer = viewer.layers.selection.active
+
+        meta = getattr(active_layer, "metadata", {})
+        pt_meta = meta.get("particle_tracking", {})
+
+        image_root = pt_meta.get("image_root")
+        channel_label = pt_meta.get("channel_label")
+
+        name = layer_name(image_root, channel_label, "preprocessed")
+
+        viewer.add_image(
+            pre,
+            name=name,
+            rgb=False,
+            metadata=pt_meta_dict(
+                role="preprocessed",
+                source_layer=active_layer.name,
+                image_root=image_root,
+                channel_label=channel_label,
+            ),
+        )
 
     # --- Detect off the UI thread ---
     @thread_worker
@@ -216,17 +237,34 @@ def particle_detection_widget(
             "n_detected_after_filter": int(n_after),
         }
 
+        active_layer = viewer.layers.selection.active
+        meta = getattr(active_layer, "metadata", {}) or {}
+        pt_meta = meta.get("particle_tracking", {}) or {}
+
+        image_root = pt_meta.get("image_root")
+        channel_label = pt_meta.get("channel_label")
+
+        puncta_name = layer_name(image_root, channel_label, "puncta")
+
         pts_layer = viewer.add_points(
             points_data,
-            name="Detected puncta",
+            name=puncta_name,
             size=30,
             face_color="transparent",
             properties=props,
             border_color="red",
             border_width=0.1,
         )
-        # assign metadata after creation
+
         pts_layer.metadata["run_params"] = run_spot_meta
+        pts_layer.metadata["particle_tracking"] = {
+            **pt_meta,
+            "role": "puncta",
+            "run_params": run_spot_meta,
+            "image_root": image_root,
+            "channel_label": channel_label,
+            "source_layer": getattr(active_layer, "name", None),
+        }
 
         if enable_density_filter:
             show_info(f"Puncta detection complete: {n_after} remain (from {n_before}) after density filter.")

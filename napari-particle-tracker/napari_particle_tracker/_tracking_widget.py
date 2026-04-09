@@ -45,7 +45,7 @@ except Exception as e:
 from napari.utils.notifications import show_info, show_warning, show_error
 
 from .tracks_table_widget import TracksTableWidget, _open_tracks_table
-from ._helpers import tracks_layer_to_dataframe, dataframe_to_tracks_layer_data
+from ._helpers import tracks_layer_to_dataframe, dataframe_to_tracks_layer_data, pt_meta_dict, layer_name
 from ._validation_state import get_or_create_validation_state, init_validation_from_tracks
 
 # Kalman tracker
@@ -255,8 +255,6 @@ else:
     disp_threshold={"label": "Min net displacement (px)", "min": 0.0, "max": 1_000.0, "step": 1.0, "value": 50.0},
     use_intersection_filter={"label": "Filter by self-intersections", "widget_type": "CheckBox"},
     max_crossings={"label": "Max crossings per track", "min": 0, "max": 200, "step": 1, "value": 10},
-    # Show track table
-    show_tracks_table={"label": "Show tracks table"},
 )
 
 def tracking_widget(
@@ -272,11 +270,7 @@ def tracking_widget(
     disp_threshold: float = 50.0,
     use_intersection_filter: bool = True,
     max_crossings: int = 10,
-    # Show track table
-    show_tracks_table=False,
 ):
-    if show_tracks_table:
-        _open_tracks_table(viewer)
 
     # auto-pick a points layer named "Detected puncta" if not set
     if points_layer is None:
@@ -347,15 +341,32 @@ def tracking_widget(
             "use_intersection_filter": bool(use_intersection_filter),
         }
 
+        active_layer = viewer.layers.selection.active
+        meta = getattr(active_layer, "metadata", {}) or {}
+        pt_meta = meta.get("particle_tracking", {}) or {}
+
+        image_root = pt_meta.get("image_root")
+        channel_label = pt_meta.get("channel_label")
+
+        track_name = layer_name(image_root, channel_label, "tracks")
+
         tracks_layer = viewer.add_tracks(
             track_data,
-            name="Tracks",
+            name=track_name,
             properties=props,
             tail_length=10,
             head_length=0,
             blending="translucent",
         )
-        tracks_layer.metadata["run_params"] = run_track_meta
+
+        tracks_layer.metadata["particle_tracking"] = {
+            **pt_meta,
+            "role": "tracks",
+            "run_params": run_track_meta,
+            "image_root": image_root,
+            "channel_label": channel_label,
+            "source_layer": getattr(active_layer, "name", None),
+        }
 
         # Load into ValidationState — preserves any prior validation work
         init_validation_from_tracks(viewer, tracks_df)
