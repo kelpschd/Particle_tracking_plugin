@@ -1,4 +1,3 @@
-# export.py
 import os
 import numpy as np
 import pandas as pd
@@ -8,17 +7,17 @@ from PIL import Image, ImageDraw
 
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QLineEdit, QCheckBox, QSpinBox, QGroupBox
+    QFileDialog, QLineEdit, QCheckBox, QSpinBox, QGroupBox, QComboBox
 )
 from napari.utils.notifications import show_info, show_warning, show_error
 
 from ._validation_state import get_validation_state
-from ._widget import particle_detection_widget
+
 
 def add_export_metadata(df: pd.DataFrame, spot_meta=None, track_meta=None, image_meta=None):
     out = df.copy()
     for prefix, meta in [
-        ("spot",  spot_meta  or {}),
+        ("spot", spot_meta or {}),
         ("track", track_meta or {}),
         ("image", image_meta or {}),
     ]:
@@ -30,6 +29,7 @@ def add_export_metadata(df: pd.DataFrame, spot_meta=None, track_meta=None, image
                 value = np.asarray(value)
                 out[col] = value if len(value) == len(out) else np.nan
     return out
+
 
 def normalize_crop_percentile(crop, lower=2, upper=98):
     """
@@ -100,37 +100,368 @@ def _resize_nn(rgb_u8, scale):
     im = im.resize((w * scale, h * scale), resample=Image.Resampling.NEAREST)
     return np.array(im, dtype=np.uint8)
 
+
 def validate_tracks_df(tracks_df: pd.DataFrame) -> None:
     required = {"frame", "x", "y", "particle"}
     missing = required - set(tracks_df.columns)
     if missing:
         raise ValueError(f"tracks_df missing columns: {missing}")
 
-# ======================================================================
-# CSV helpers
-# ======================================================================
+
+def _get_pt_meta(layer):
+    meta = getattr(layer, "metadata", {}) or {}
+    pt_meta = meta.get("particle_tracking", {}) or {}
+    return pt_meta if isinstance(pt_meta, dict) else {}
+
+
+def _collect_channel_colors(image_import_widget, viewer=None):
+    """
+    Collect channel RGB colors from the imported image metadata.
+    Priority:
+      1) image_import_widget._channel_info
+      2) viewer image layer metadata
+      3) fallback defaults
+    Returns dict[int, tuple[int,int,int]]
+    """
+    colors = {}
+
+    channel_info = getattr(image_import_widget, "_channel_info", None) or []
+    for info in channel_info:
+        try:
+            idx = int(info.get("index"))
+        except Exception:
+            continue
+
+        rgb = info.get("rgb")
+        if rgb is None:
+            rgb = info.get("channel_rgb")
+        if rgb is None:
+            continue
+
+        try:
+            colors[idx] = tuple(int(v) for v in rgb)
+        except Exception:
+            continue
+
+    if not colors and viewer is not None:
+        for ly in viewer.layers:
+            meta = getattr(ly, "metadata", {}) or {}
+            pt_meta = meta.get("particle_tracking", {}) or {}
+            if pt_meta.get("role") == "raw_image":
+                idx = pt_meta.get("channel_index")
+                rgb = pt_meta.get("channel_rgb")
+                if idx is not None and rgb is not None:
+                    try:
+                        colors[int(idx)] = tuple(int(v) for v in rgb)
+                    except Exception:
+                        pass
+
+    if not colors:
+        colors = {
+            0: (255, 0, 255),
+            1: (255, 0, 0),
+            2: (0, 255, 0),
+        }
+
+    return colors
+
+
+def _composite_rgb_frame(
+    crop_norm,
+    t,
+    C,
+    channel_colors,
+    upscale,
+):
+    """
+    Build a pseudocolored composite frame from all available channel colors.
+    """
+    h, w = crop_norm.shape[2], crop_norm.shape[3]
+
+    pseudo_list = []
+    for c in sorted(channel_colors.keys()):
+        if 0 <= c < C:
+            pseudo_list.append(
+                _resize_nn(
+                    _apply_pseudocolor(
+                        crop_norm[t, c],
+                        channel_colors.get(c, (255, 255, 255)),
+                    ),
+                    upscale,
+                )
+            )
+
+    if pseudo_list:
+        return _merge_rgb(pseudo_list)
+
+    return np.zeros((h * upscale, w * upscale, 3), dtype=np.uint8)
+
+
+def _save_track_movies_video(
+    img_array,
+    track_df,
+    image_name,
+    output_dir,
+    *,
+    ext,
+    fourcc,
+    padding=40,
+    fps=10,
+    channel_colors=None,
+    upscale=1,
+    norm_lower=2,
+    norm_upper=98,
+    circle_r=6,
+    line_w=2,
+    only_track_frames=True,
+    pseudocolor_single=False,
+):
+    if img_array.ndim != 4:
+        raise ValueError(f"Expected (T,C,Y,X), got {img_array.shape}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    T, C, Y, X = img_array.shape
+    base_name = os.path.splitext(os.path.basename(image_name))[0].replace(" ", "_")
+
+    df = track_df.copy()
+    df["frame"] = df["frame"].astype(int)
+    df = df.sort_values(["particle", "frame"])
+
+    if channel_colors is None:
+        channel_colors = {
+            0: (255, 0, 255),
+            1: (255, 0, 0),
+            2: (0, 255, 0),
+        }
+
+    for pid, group in df.groupby("particle"):
+        group = group.sort_values("frame")
+
+        y_min, y_max = int(np.floor(group["y"].min())), int(np.ceil(group["y"].max()))
+        x_min, x_max = int(np.floor(group["x"].min())), int(np.ceil(group["x"].max()))
+
+        y1 = max(y_min - padding, 0)
+        y2 = min(y_max + padding, Y)
+        x1 = max(x_min - padding, 0)
+        x2 = min(x_max + padding, X)
+
+        if y2 <= y1 or x2 <= x1:
+            continue
+
+        crop = img_array[:, :, y1:y2, x1:x2]
+        crop_norm = normalize_crop_percentile(crop, lower=norm_lower, upper=norm_upper)
+        h, w = crop_norm.shape[2], crop_norm.shape[3]
+
+        centers = {
+            int(r["frame"]): (float(r["x"]) - x1, float(r["y"]) - y1)
+            for _, r in group.iterrows()
+            if 0 <= int(r["frame"]) < T
+        }
+
+        if only_track_frames:
+            frame_list = sorted(centers.keys())
+        else:
+            frame_list = list(range(T))
+
+        if not frame_list:
+            continue
+
+        path_so_far = []
+        track_by_frame = {}
+        for t in sorted(centers.keys()):
+            path_so_far.append(centers[t])
+            track_by_frame[t] = path_so_far.copy()
+
+        # composite output, always pseudocolored
+        out_path = os.path.join(output_dir, f"{base_name}_track{pid}_composite{ext}")
+        writer = cv2.VideoWriter(
+            out_path,
+            cv2.VideoWriter_fourcc(*fourcc),
+            fps,
+            (w * upscale, h * upscale),
+            isColor=True,
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not open video writer for {out_path}")
+
+        # single-channel writers
+        channel_writers = []
+        for c in range(C):
+            ch_out = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}{ext}")
+            ch_writer = cv2.VideoWriter(
+                ch_out,
+                cv2.VideoWriter_fourcc(*fourcc),
+                fps,
+                (w * upscale, h * upscale),
+                isColor=True,
+            )
+            if not ch_writer.isOpened():
+                raise RuntimeError(f"Could not open video writer for {ch_out}")
+            channel_writers.append((c, ch_out, ch_writer))
+
+        for t in frame_list:
+            # composite frame, always pseudocolored
+            comp_rgb = _composite_rgb_frame(
+                crop_norm=crop_norm,
+                t=t,
+                C=C,
+                channel_colors=channel_colors,
+                upscale=upscale,
+            )
+
+            center = centers.get(t)
+            if center is not None:
+                comp_rgb = _draw_overlays(
+                    comp_rgb,
+                    center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
+                    track_xy=[
+                        (int(p[0] * upscale), int(p[1] * upscale))
+                        for p in track_by_frame.get(t, [])
+                    ],
+                    circle_r=circle_r * upscale,
+                    line_w=max(1, line_w * upscale),
+                )
+
+            writer.write(cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR))
+
+            # single-channel frames
+            for c, _, ch_writer in channel_writers:
+                gray = crop_norm[t, c]
+
+                if pseudocolor_single:
+                    rgb = _resize_nn(
+                        _apply_pseudocolor(gray, channel_colors.get(c, (255, 255, 255))),
+                        upscale,
+                    )
+                else:
+                    rgb = _resize_nn(_to_rgb(gray), upscale)
+
+                if center is not None:
+                    rgb = _draw_overlays(
+                        rgb,
+                        center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
+                        track_xy=[
+                            (int(p[0] * upscale), int(p[1] * upscale))
+                            for p in track_by_frame.get(t, [])
+                        ],
+                        circle_r=circle_r * upscale,
+                        line_w=max(1, line_w * upscale),
+                    )
+
+                ch_writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+        writer.release()
+        for _, _, ch_writer in channel_writers:
+            ch_writer.release()
+
+        print(f"Saved {out_path}")
+        for _, ch_out, _ in channel_writers:
+            print(f"Saved {ch_out}")
+
+
+def save_track_movies_mp4(
+    img_array,
+    track_df,
+    image_name,
+    output_dir,
+    padding=40,
+    fps=10,
+    channel_colors=None,
+    upscale=1,
+    norm_lower=2,
+    norm_upper=98,
+    circle_r=6,
+    line_w=2,
+    only_track_frames=True,
+    pseudocolor_single=False,
+):
+    _save_track_movies_video(
+        img_array=img_array,
+        track_df=track_df,
+        image_name=image_name,
+        output_dir=output_dir,
+        ext=".mp4",
+        fourcc="mp4v",
+        padding=padding,
+        fps=fps,
+        channel_colors=channel_colors,
+        upscale=upscale,
+        norm_lower=norm_lower,
+        norm_upper=norm_upper,
+        circle_r=circle_r,
+        line_w=line_w,
+        only_track_frames=only_track_frames,
+        pseudocolor_single=pseudocolor_single,
+    )
+
+
+def save_track_movies_avi(
+    img_array,
+    track_df,
+    image_name,
+    output_dir,
+    padding=40,
+    fps=10,
+    channel_colors=None,
+    upscale=1,
+    norm_lower=2,
+    norm_upper=98,
+    circle_r=6,
+    line_w=2,
+    only_track_frames=True,
+    pseudocolor_single=False,
+):
+    _save_track_movies_video(
+        img_array=img_array,
+        track_df=track_df,
+        image_name=image_name,
+        output_dir=output_dir,
+        ext=".avi",
+        fourcc="MJPG",
+        padding=padding,
+        fps=fps,
+        channel_colors=channel_colors,
+        upscale=upscale,
+        norm_lower=norm_lower,
+        norm_upper=norm_upper,
+        circle_r=circle_r,
+        line_w=line_w,
+        only_track_frames=only_track_frames,
+        pseudocolor_single=pseudocolor_single,
+    )
+
 
 def _collect_layer_meta(viewer):
     """Pull run_params from Points and Tracks layers stored at run-time."""
     spot_meta = {}
     track_meta = {}
 
-    pts_layers = [
-        ly for ly in viewer.layers
-        if ly.__class__.__name__ == "Points"
-        and getattr(ly, "name", "") == "Detected puncta"
-    ]
-    if pts_layers:
-        spot_meta = pts_layers[0].metadata.get("run_params", {})
+    pts_layers = []
+    trk_layers = []
 
-    trk_layers = [
-        ly for ly in viewer.layers
-        if ly.__class__.__name__ == "Tracks"
-    ]
+    for ly in viewer.layers:
+        pt_meta = _get_pt_meta(ly)
+        role = pt_meta.get("role")
+
+        if ly.__class__.__name__ == "Points" and (
+            role == "puncta" or getattr(ly, "name", "") == "Detected puncta"
+        ):
+            pts_layers.append(ly)
+
+        if ly.__class__.__name__ == "Tracks" and (
+            role == "tracks" or getattr(ly, "name", "") == "Tracks"
+        ):
+            trk_layers.append(ly)
+
+    if pts_layers:
+        spot_meta = _get_pt_meta(pts_layers[0]).get("run_params", {})
+
     if trk_layers:
-        track_meta = trk_layers[0].metadata.get("run_params", {})
+        track_meta = _get_pt_meta(trk_layers[0]).get("run_params", {})
 
     return spot_meta, track_meta
+
 
 def save_tracks_csv(
     tracks_df: pd.DataFrame,
@@ -157,117 +488,6 @@ def save_tracks_csv(
     out_df.to_csv(out_path, index=False)
 
 
-def save_track_movies_mp4(
-    img_array,
-    track_df,
-    image_name,
-    output_dir,
-    padding=40,
-    fps=10,
-    channel_colors=None,
-    composite_channels=(0, 1, 2),
-    upscale=1,
-    norm_lower=2,
-    norm_upper=98,
-    circle_r=6,
-    line_w=2,
-    only_track_frames=True,
-):
-    """
-    img_array: (T, C, Y, X)
-    track_df: must contain particle, frame, y, x
-    """
-    if img_array.ndim != 4:
-        raise ValueError(f"Expected (T,C,Y,X), got {img_array.shape}")
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    if channel_colors is None:
-        channel_colors = {
-            0: (255, 0, 255),
-            1: (255, 0, 0),
-            2: (0, 255, 0),
-        }
-
-    T, C, Y, X = img_array.shape
-    base_name = os.path.splitext(os.path.basename(image_name))[0].replace(" ", "_")
-
-    df = track_df.copy()
-    df["frame"] = df["frame"].astype(int)
-    df = df.sort_values(["particle", "frame"])
-
-    for pid, group in df.groupby("particle"):
-        group = group.sort_values("frame")
-
-        y_min, y_max = int(np.floor(group["y"].min())), int(np.ceil(group["y"].max()))
-        x_min, x_max = int(np.floor(group["x"].min())), int(np.ceil(group["x"].max()))
-
-        y1 = max(y_min - padding, 0)
-        y2 = min(y_max + padding, Y)
-        x1 = max(x_min - padding, 0)
-        x2 = min(x_max + padding, X)
-
-        if y2 <= y1 or x2 <= x1:
-            continue
-
-        crop = img_array[:, :, y1:y2, x1:x2]
-        crop_norm = normalize_crop_percentile(crop, lower=norm_lower, upper=norm_upper)
-        h, w = crop_norm.shape[2], crop_norm.shape[3]
-
-        centers = {
-            int(r["frame"]): (float(r["x"]) - x1, float(r["y"]) - y1)
-            for _, r in group.iterrows()
-            if 0 <= int(r["frame"]) < T
-        }
-
-        if only_track_frames:
-            frame_list = sorted(centers.keys())
-        else:
-            frame_list = list(range(T))
-
-        if not frame_list:
-            continue
-
-        path_so_far = []
-        track_by_frame = {}
-        for t in sorted(centers.keys()):
-            path_so_far.append(centers[t])
-            track_by_frame[t] = path_so_far.copy()
-
-        for c in range(C):
-            out_path = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}.mp4")
-            writer = cv2.VideoWriter(
-                out_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                fps,
-                (w * upscale, h * upscale),
-                isColor=True,
-            )
-
-            for t in frame_list:
-                gray = crop_norm[t, c]
-                rgb = _to_rgb(gray)
-                rgb = _resize_nn(rgb, upscale)
-
-                center = centers.get(t)
-                if center is not None:
-                    rgb = _draw_overlays(
-                        rgb,
-                        center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
-                        track_xy=[
-                            (int(p[0] * upscale), int(p[1] * upscale))
-                            for p in track_by_frame.get(t, [])
-                        ],
-                        circle_r=circle_r * upscale,
-                        line_w=max(1, line_w * upscale),
-                    )
-
-                writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-
-            writer.release()
-            print(f"Saved {out_path}")
-
-
 def save_track_gifs(
     img_array,
     track_df,
@@ -279,15 +499,19 @@ def save_track_gifs(
     norm_lower=2,
     norm_upper=98,
     channel_colors=None,
-    composite_channels=(0, 1, 2),
     circle_r=6,
     line_w=2,
     only_track_frames=True,
+    pseudocolor_single=False,
 ):
     if img_array.ndim != 4:
         raise ValueError(f"Expected (T,C,Y,X), got {img_array.shape}")
 
     os.makedirs(output_dir, exist_ok=True)
+
+    T, C, Y, X = img_array.shape
+    base_name = os.path.splitext(os.path.basename(image_name))[0].replace(" ", "_")
+    duration = 1.0 / fps
 
     if channel_colors is None:
         channel_colors = {
@@ -295,10 +519,6 @@ def save_track_gifs(
             1: (255, 0, 0),
             2: (0, 255, 0),
         }
-
-    T, C, Y, X = img_array.shape
-    base_name = os.path.splitext(os.path.basename(image_name))[0].replace(" ", "_")
-    duration = 1.0 / fps
 
     df = track_df.copy()
     df["frame"] = df["frame"].astype(int)
@@ -342,39 +562,72 @@ def save_track_gifs(
             path_so_far.append(centers[t])
             track_by_frame[t] = path_so_far.copy()
 
+        # composite gif frames, always pseudocolored
         comp_raw = []
         comp_ann = []
+
+        # single-channel gif frame buffers
+        single_raw = {c: [] for c in range(C)}
+        single_ann = {c: [] for c in range(C)}
 
         for t in frame_list:
             center = centers.get(t)
             pts = track_by_frame.get(t, [])
 
-            pseudo_list = []
-            for c in range(C):
-                gray = crop_norm[t, c]
-                if c in composite_channels:
-                    pseudo_list.append(_resize_nn(_apply_pseudocolor(gray, channel_colors.get(c, (255, 255, 255))), upscale))
+            comp_rgb = _composite_rgb_frame(
+                crop_norm=crop_norm,
+                t=t,
+                C=C,
+                channel_colors=channel_colors,
+                upscale=upscale,
+            )
+            comp_raw.append(comp_rgb)
 
-            merged = _merge_rgb(pseudo_list) if pseudo_list else np.zeros((h * upscale, w * upscale, 3), dtype=np.uint8)
-
-            comp_raw.append(merged)
-
-            merged_ann = merged
+            comp_rgb_ann = comp_rgb.copy()
             if center is not None:
-                merged_ann = _draw_overlays(
-                    merged.copy(),
+                comp_rgb_ann = _draw_overlays(
+                    comp_rgb_ann,
                     center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
                     track_xy=[(int(p[0] * upscale), int(p[1] * upscale)) for p in pts],
                     circle_r=circle_r * upscale,
                     line_w=max(1, line_w * upscale),
                 )
-            comp_ann.append(merged_ann)
+            comp_ann.append(comp_rgb_ann)
+
+            for c in range(C):
+                gray = crop_norm[t, c]
+
+                if pseudocolor_single:
+                    raw = _resize_nn(_apply_pseudocolor(gray, channel_colors.get(c, (255, 255, 255))), upscale)
+                else:
+                    raw = _resize_nn(_to_rgb(gray), upscale)
+
+                ann = raw.copy()
+                if center is not None:
+                    ann = _draw_overlays(
+                        ann,
+                        center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
+                        track_xy=[(int(p[0] * upscale), int(p[1] * upscale)) for p in pts],
+                        circle_r=circle_r * upscale,
+                        line_w=max(1, line_w * upscale),
+                    )
+
+                single_raw[c].append(raw)
+                single_ann[c].append(ann)
 
         fn_raw = os.path.join(output_dir, f"{base_name}_track{pid}_composite_raw.gif")
         fn_ann = os.path.join(output_dir, f"{base_name}_track{pid}_composite_annot.gif")
         iio.imwrite(fn_raw, comp_raw, duration=duration, loop=0)
         iio.imwrite(fn_ann, comp_ann, duration=duration, loop=0)
+
+        for c in range(C):
+            fn_ch_raw = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_raw.gif")
+            fn_ch_ann = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_annot.gif")
+            iio.imwrite(fn_ch_raw, single_raw[c], duration=duration, loop=0)
+            iio.imwrite(fn_ch_ann, single_ann[c], duration=duration, loop=0)
+
         print(f"Saved gifs for track {pid}")
+
 
 def resample_polyline_equal_arclength(xy: np.ndarray, n_samples: int) -> np.ndarray:
     xy = np.asarray(xy, dtype=np.float32)
@@ -389,8 +642,14 @@ def resample_polyline_equal_arclength(xy: np.ndarray, n_samples: int) -> np.ndar
     if total < 1e-6:
         return np.repeat(xy[:1], n_samples, axis=0)
     s_new = np.linspace(0, total, n_samples, dtype=np.float32)
-    return np.stack([np.interp(s_new, s, xy[:, 0]),
-                     np.interp(s_new, s, xy[:, 1])], axis=1).astype(np.float32)
+    return np.stack(
+        [
+            np.interp(s_new, s, xy[:, 0]),
+            np.interp(s_new, s, xy[:, 1]),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
 
 def tangents_and_normals_from_path(path_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     p = np.asarray(path_xy, dtype=np.float32)
@@ -404,6 +663,7 @@ def tangents_and_normals_from_path(path_xy: np.ndarray) -> tuple[np.ndarray, np.
     t_hat = dp / n
     n_hat = np.stack([-t_hat[:, 1], t_hat[:, 0]], axis=1)
     return t_hat.astype(np.float32), n_hat.astype(np.float32)
+
 
 def kymograph_along_fixed_path(
     stack: np.ndarray,          # (T, C, Y, X) or (T, Y, X)
@@ -465,6 +725,7 @@ def kymograph_along_fixed_path(
 
     return kymo
 
+
 def save_kymos(out_dir, track_id, kymo_ncl, save_float_tif=True,
                save_png=True, make_rgb=True, png_scale=1, png_bitdepth=8):
     os.makedirs(out_dir, exist_ok=True)
@@ -475,7 +736,8 @@ def save_kymos(out_dir, track_id, kymo_ncl, save_float_tif=True,
         scaled = np.clip((img2d - vmin) / (vmax - vmin + 1e-12), 0, 1)
         scaled = np.nan_to_num(scaled)
         out = (scaled * (65535 if png_bitdepth == 16 else 255)).astype(
-            np.uint16 if png_bitdepth == 16 else np.uint8)
+            np.uint16 if png_bitdepth == 16 else np.uint8
+        )
         if png_scale > 1:
             out = np.kron(out, np.ones((png_scale, png_scale), dtype=out.dtype))
         return out
@@ -483,8 +745,10 @@ def save_kymos(out_dir, track_id, kymo_ncl, save_float_tif=True,
     for c in range(C):
         img = kymo_ncl[:, c, :]
         if save_float_tif:
-            iio.imwrite(os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.tif"),
-                        img.astype(np.float32))
+            iio.imwrite(
+                os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.tif"),
+                img.astype(np.float32)
+            )
         if save_png:
             iio.imwrite(os.path.join(out_dir, f"track_{track_id}_kymo_ch{c}.png"), _scale(img))
 
@@ -498,6 +762,7 @@ def save_kymos(out_dir, track_id, kymo_ncl, save_float_tif=True,
         if png_scale > 1:
             rgb = np.kron(rgb, np.ones((png_scale, png_scale, 1), dtype=rgb.dtype))
         iio.imwrite(os.path.join(out_dir, f"track_{track_id}_kymo_rgb.png"), rgb)
+
 
 def export_all_track_kymographs_from_array(
     img_array, tracks_df, out_root, image_name,
@@ -515,7 +780,8 @@ def export_all_track_kymographs_from_array(
     df = tracks_df.copy()
     if "image_name" in df.columns:
         df["_root"] = df["image_name"].astype(str).apply(
-            lambda s: os.path.splitext(os.path.basename(s))[0])
+            lambda s: os.path.splitext(os.path.basename(s))[0]
+        )
         df = df[df["_root"] == image_root].drop(columns=["_root"], errors="ignore")
     if df.empty:
         raise ValueError(f"No tracks found for image '{image_root}'")
@@ -533,20 +799,22 @@ def export_all_track_kymographs_from_array(
             path_xy=path_xy, width_px=W, width_reduce=width_reduce,
         )
         out_dir = os.path.join(out_root_img, f"particle_{pid}")
-        save_kymos(out_dir=out_dir, track_id=pid, kymo_ncl=kymo,
-                   save_float_tif=True, save_png=True, make_rgb=True,
-                   png_scale=3, png_bitdepth=8)
+        save_kymos(
+            out_dir=out_dir, track_id=pid, kymo_ncl=kymo,
+            save_float_tif=True, save_png=True, make_rgb=True,
+            png_scale=3, png_bitdepth=8
+        )
         meta = g[["frame", "x", "y"]].copy()
         meta["frame_0based"] = frames_track
         meta.to_csv(os.path.join(out_dir, f"track_{pid}_meta.csv"), index=False)
-        np.savetxt(os.path.join(out_dir, f"track_{pid}_path_xy.csv"),
-                   path_xy, delimiter=",", header="x,y", comments="")
+        np.savetxt(
+            os.path.join(out_dir, f"track_{pid}_path_xy.csv"),
+            path_xy, delimiter=",", header="x,y", comments=""
+        )
         pd.DataFrame({"frame_0based_used": frames_used}).to_csv(
-            os.path.join(out_dir, f"track_{pid}_kymo_frames_used.csv"), index=False)
+            os.path.join(out_dir, f"track_{pid}_kymo_frames_used.csv"), index=False
+        )
 
-# ======================================================================
-# Export Widget
-# ======================================================================
 
 class ExportWidget(QWidget):
     def __init__(self, viewer, image_import_widget, parent=None):
@@ -562,7 +830,6 @@ class ExportWidget(QWidget):
         csv_group = QGroupBox("CSV Export")
         csv_layout = QVBoxLayout(csv_group)
 
-        # Path picker
         row1 = QHBoxLayout()
         self.csv_path = QLineEdit()
         self.csv_path.setPlaceholderText("Output CSV path...")
@@ -572,7 +839,6 @@ class ExportWidget(QWidget):
         row1.addWidget(csv_btn)
         csv_layout.addLayout(row1)
 
-        # Two export buttons
         self.save_validated_btn = QPushButton("Export validated tracks CSV")
         self.save_validated_btn.setToolTip(
             "Saves only kept tracks — clean ground truth, no status column."
@@ -602,31 +868,61 @@ class ExportWidget(QWidget):
         row2.addWidget(movie_btn)
         movie_layout.addLayout(row2)
 
-        self.save_mp4_btn = QPushButton("Export MP4 movies")
-        self.save_mp4_btn.clicked.connect(self._save_mp4)
-        movie_layout.addWidget(self.save_mp4_btn)
+        self.export_format = QComboBox()
+        self.export_format.addItems(["MP4", "GIF", "AVI"])
+        movie_layout.addWidget(QLabel("Movie format"))
+        movie_layout.addWidget(self.export_format)
 
-        self.save_gif_btn = QPushButton("Export GIFs")
-        self.save_gif_btn.clicked.connect(self._save_gif)
-        movie_layout.addWidget(self.save_gif_btn)
+        self.padding = QSpinBox()
+        self.padding.setRange(0, 1000)
+        self.padding.setValue(40)
+
+        self.fps = QSpinBox()
+        self.fps.setRange(1, 120)
+        self.fps.setValue(10)
+
+        self.upscale = QSpinBox()
+        self.upscale.setRange(1, 10)
+        self.upscale.setValue(2)
+
+        movie_layout.addWidget(QLabel("Padding"))
+        movie_layout.addWidget(self.padding)
+        movie_layout.addWidget(QLabel("FPS"))
+        movie_layout.addWidget(self.fps)
+        movie_layout.addWidget(QLabel("Upscale"))
+        movie_layout.addWidget(self.upscale)
+        self.pseudocolor_single = QCheckBox("Pseudocolor single-channel movies")
+        self.pseudocolor_single.setChecked(False)
+        movie_layout.addWidget(self.pseudocolor_single)
+        self.only_track_frames = QCheckBox("Only frames where track exists")
+        self.only_track_frames.setChecked(False)
+        movie_layout.addWidget(self.only_track_frames)
+
+        self.export_movie_btn = QPushButton("Export track movies")
+        self.export_movie_btn.clicked.connect(self._save_movie)
+        movie_layout.addWidget(self.export_movie_btn)
+
+        layout.addWidget(movie_group)
+
+        # Kymograph export group
+        kymo_group = QGroupBox("Kymograph Export")
+        kymo_layout = QVBoxLayout(kymo_group)
+
+        row3 = QHBoxLayout()
+        self.kymo_dir = QLineEdit()
+        self.kymo_dir.setPlaceholderText("Output folder...")
+        kymo_btn = QPushButton("Browse...")
+        kymo_btn.clicked.connect(self._pick_kymo_dir)
+        row3.addWidget(self.kymo_dir)
+        row3.addWidget(kymo_btn)
+        kymo_layout.addLayout(row3)
 
         self.save_kymo_btn = QPushButton("Export kymographs")
         self.save_kymo_btn.clicked.connect(self._save_kymographs)
-        movie_layout.addWidget(self.save_kymo_btn)
+        kymo_layout.addWidget(self.save_kymo_btn)
 
-        # Settings
-        self.padding = QSpinBox(); self.padding.setRange(0, 1000); self.padding.setValue(40)
-        self.fps = QSpinBox(); self.fps.setRange(1, 120); self.fps.setValue(10)
-        self.upscale = QSpinBox(); self.upscale.setRange(1, 10); self.upscale.setValue(2)
-        self.only_track_frames = QCheckBox("Only frames where track exists")
-        self.only_track_frames.setChecked(True)
+        layout.addWidget(kymo_group)
 
-        movie_layout.addWidget(QLabel("Padding")); movie_layout.addWidget(self.padding)
-        movie_layout.addWidget(QLabel("FPS"));     movie_layout.addWidget(self.fps)
-        movie_layout.addWidget(QLabel("Upscale")); movie_layout.addWidget(self.upscale)
-        movie_layout.addWidget(self.only_track_frames)
-
-        layout.addWidget(movie_group)
         layout.addStretch(1)
 
     def _pick_csv(self):
@@ -638,6 +934,11 @@ class ExportWidget(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
         if path:
             self.movie_dir.setText(path)
+
+    def _pick_kymo_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "Select output directory")
+        if path:
+            self.kymo_dir.setText(path)
 
     def _get_state(self):
         state = get_validation_state(self.viewer)
@@ -668,6 +969,9 @@ class ExportWidget(QWidget):
         image_meta = {"image_name": getattr(self.image_import_widget, "nd2_path", "")}
         return spot_meta, track_meta, image_meta
 
+    def _get_channel_colors(self):
+        return _collect_channel_colors(self.image_import_widget, self.viewer)
+
     def _require_csv_path(self):
         path = self.csv_path.text().strip()
         if not path:
@@ -676,6 +980,12 @@ class ExportWidget(QWidget):
 
     def _require_movie_dir(self):
         d = self.movie_dir.text().strip()
+        if not d:
+            raise ValueError("Choose an output directory first.")
+        return d
+    
+    def _require_kymo_dir(self):
+        d = self.kymo_dir.text().strip()
         if not d:
             raise ValueError("Choose an output directory first.")
         return d
@@ -744,41 +1054,45 @@ class ExportWidget(QWidget):
             )
         return state.validated_df()
 
-    def _save_mp4(self):
+    def _save_movie(self):
         try:
             out_dir = self._require_movie_dir()
             df = self._get_export_df()
             arr = self._get_image_array()
             image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
-            save_track_movies_mp4(
-                img_array=arr, track_df=df, image_name=image_name,
-                output_dir=out_dir, padding=self.padding.value(),
-                fps=self.fps.value(), upscale=self.upscale.value(),
-                only_track_frames=self.only_track_frames.isChecked(),
-            )
-            show_info("MP4 export complete.")
-        except Exception as e:
-            show_error(str(e))
+            channel_colors = self._get_channel_colors()
 
-    def _save_gif(self):
-        try:
-            out_dir = self._require_movie_dir()
-            df = self._get_export_df()
-            arr = self._get_image_array()
-            image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
-            save_track_gifs(
-                img_array=arr, track_df=df, image_name=image_name,
-                output_dir=out_dir, padding=self.padding.value(),
-                fps=self.fps.value(), upscale=self.upscale.value(),
+            fmt = self.export_format.currentText().strip().upper()
+
+            common = dict(
+                img_array=arr,
+                track_df=df,
+                image_name=image_name,
+                output_dir=out_dir,
+                padding=self.padding.value(),
+                fps=self.fps.value(),
+                upscale=self.upscale.value(),
                 only_track_frames=self.only_track_frames.isChecked(),
+                channel_colors=channel_colors,
+                pseudocolor_single=self.pseudocolor_single.isChecked(),
             )
-            show_info("GIF export complete.")
+
+            if fmt == "MP4":
+                save_track_movies_mp4(**common)
+            elif fmt == "GIF":
+                save_track_gifs(**common)
+            elif fmt == "AVI":
+                save_track_movies_avi(**common)
+            else:
+                raise ValueError(f"Unknown export format: {fmt}")
+
+            show_info(f"{fmt} export complete.")
         except Exception as e:
             show_error(str(e))
 
     def _save_kymographs(self):
         try:
-            out_dir = self._require_movie_dir()
+            out_dir = self._require_kymo_dir()
             df = self._get_export_df()
             arr = self._get_image_array()
             image_name = getattr(self.image_import_widget, "nd2_path", "image.nd2")
@@ -789,4 +1103,4 @@ class ExportWidget(QWidget):
             )
             show_info("Kymograph export complete.")
         except Exception as e:
-            show_error(str(e))  
+            show_error(str(e))
