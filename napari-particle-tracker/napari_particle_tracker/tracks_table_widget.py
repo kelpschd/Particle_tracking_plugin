@@ -1,8 +1,10 @@
 # tracks_table_widget.py
-
 from qtpy import QtWidgets, QtCore
 import numpy as np
 import pandas as pd
+
+from napari.utils.notifications import show_warning
+from ._helpers import tracks_layer_to_dataframe, dataframe_to_tracks_layer_data
 
 # -------------------------
 # Tracks table helpers
@@ -159,13 +161,17 @@ class TracksTableWidget(QtWidgets.QWidget):
     # BUTTON ACTIONS
     # ------------------------------------------------------------------
     def _reload_from_layer(self):
-        """Reload table from the current Tracks layer data."""
+        if self.tracks_layer is None:
+            show_warning("No Tracks layer linked to this table.")
+            return
         df = tracks_layer_to_dataframe(self.tracks_layer)
         self._df = df
         self._populate_table_from_df()
 
     def _apply_to_layer(self):
-        """Push table edits back into the Tracks layer."""
+        if self.tracks_layer is None:
+            show_warning("No Tracks layer linked to this table.")
+            return
         self._update_df_from_table()
         data, properties = dataframe_to_tracks_layer_data(self._df)
         self.tracks_layer.data = data

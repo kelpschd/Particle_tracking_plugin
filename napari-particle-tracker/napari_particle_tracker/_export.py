@@ -215,6 +215,7 @@ def _save_track_movies_video(
     line_w=2,
     only_track_frames=True,
     pseudocolor_single=False,
+    annotate=True, 
 ):
     if img_array.ndim != 4:
         raise ValueError(f"Expected (T,C,Y,X), got {img_array.shape}")
@@ -273,73 +274,61 @@ def _save_track_movies_video(
             path_so_far.append(centers[t])
             track_by_frame[t] = path_so_far.copy()
 
-        # composite output, always pseudocolored
-        out_path = os.path.join(output_dir, f"{base_name}_track{pid}_composite{ext}")
-        writer = cv2.VideoWriter(
-            out_path,
-            cv2.VideoWriter_fourcc(*fourcc),
-            fps,
-            (w * upscale, h * upscale),
-            isColor=True,
+        # composite writers — always write raw, also write annotated if annotate=True
+        out_path_raw = os.path.join(output_dir, f"{base_name}_track{pid}_composite_raw{ext}")
+        writer_raw = cv2.VideoWriter(
+            out_path_raw, cv2.VideoWriter_fourcc(*fourcc),
+            fps, (w * upscale, h * upscale), isColor=True,
         )
-        if not writer.isOpened():
-            raise RuntimeError(f"Could not open video writer for {out_path}")
+        if not writer_raw.isOpened():
+            raise RuntimeError(f"Could not open video writer for {out_path_raw}")
 
-        # single-channel writers
+        writer_ann = None
+        if annotate:
+            out_path_ann = os.path.join(output_dir, f"{base_name}_track{pid}_composite_annot{ext}")
+            writer_ann = cv2.VideoWriter(
+                out_path_ann, cv2.VideoWriter_fourcc(*fourcc),
+                fps, (w * upscale, h * upscale), isColor=True,
+            )
+            if not writer_ann.isOpened():
+                raise RuntimeError(f"Could not open video writer for {out_path_ann}")
+
+        # single-channel writers — same pattern
         channel_writers = []
         for c in range(C):
-            ch_out = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}{ext}")
-            ch_writer = cv2.VideoWriter(
-                ch_out,
-                cv2.VideoWriter_fourcc(*fourcc),
-                fps,
-                (w * upscale, h * upscale),
-                isColor=True,
+            ch_out_raw = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_raw{ext}")
+            ch_writer_raw = cv2.VideoWriter(
+                ch_out_raw, cv2.VideoWriter_fourcc(*fourcc),
+                fps, (w * upscale, h * upscale), isColor=True,
             )
-            if not ch_writer.isOpened():
-                raise RuntimeError(f"Could not open video writer for {ch_out}")
-            channel_writers.append((c, ch_out, ch_writer))
+            if not ch_writer_raw.isOpened():
+                raise RuntimeError(f"Could not open video writer for {ch_out_raw}")
+
+            ch_writer_ann = None
+            if annotate:
+                ch_out_ann = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_annot{ext}")
+                ch_writer_ann = cv2.VideoWriter(
+                    ch_out_ann, cv2.VideoWriter_fourcc(*fourcc),
+                    fps, (w * upscale, h * upscale), isColor=True,
+                )
+                if not ch_writer_ann.isOpened():
+                    raise RuntimeError(f"Could not open video writer for {ch_out_ann}")
+
+            channel_writers.append((c, ch_writer_raw, ch_writer_ann))
 
         for t in frame_list:
-            # composite frame, always pseudocolored
             comp_rgb = _composite_rgb_frame(
-                crop_norm=crop_norm,
-                t=t,
-                C=C,
-                channel_colors=channel_colors,
-                upscale=upscale,
+                crop_norm=crop_norm, t=t, C=C,
+                channel_colors=channel_colors, upscale=upscale,
             )
+            writer_raw.write(cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR))
 
             center = centers.get(t)
-            if center is not None:
-                comp_rgb = _draw_overlays(
-                    comp_rgb,
-                    center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
-                    track_xy=[
-                        (int(p[0] * upscale), int(p[1] * upscale))
-                        for p in track_by_frame.get(t, [])
-                    ],
-                    circle_r=circle_r * upscale,
-                    line_w=max(1, line_w * upscale),
-                )
-
-            writer.write(cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR))
-
-            # single-channel frames
-            for c, _, ch_writer in channel_writers:
-                gray = crop_norm[t, c]
-
-                if pseudocolor_single:
-                    rgb = _resize_nn(
-                        _apply_pseudocolor(gray, channel_colors.get(c, (255, 255, 255))),
-                        upscale,
-                    )
-                else:
-                    rgb = _resize_nn(_to_rgb(gray), upscale)
-
+            if annotate and writer_ann is not None:
+                comp_ann = comp_rgb.copy()
                 if center is not None:
-                    rgb = _draw_overlays(
-                        rgb,
+                    comp_ann = _draw_overlays(
+                        comp_ann,
                         center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
                         track_xy=[
                             (int(p[0] * upscale), int(p[1] * upscale))
@@ -348,16 +337,46 @@ def _save_track_movies_video(
                         circle_r=circle_r * upscale,
                         line_w=max(1, line_w * upscale),
                     )
+                writer_ann.write(cv2.cvtColor(comp_ann, cv2.COLOR_RGB2BGR))
 
-                ch_writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            for c, ch_writer_raw, ch_writer_ann in channel_writers:
+                gray = crop_norm[t, c]
+                if pseudocolor_single:
+                    rgb = _resize_nn(
+                        _apply_pseudocolor(gray, channel_colors.get(c, (255, 255, 255))),
+                        upscale,
+                    )
+                else:
+                    rgb = _resize_nn(_to_rgb(gray), upscale)
 
-        writer.release()
-        for _, _, ch_writer in channel_writers:
-            ch_writer.release()
+                ch_writer_raw.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
-        print(f"Saved {out_path}")
-        for _, ch_out, _ in channel_writers:
-            print(f"Saved {ch_out}")
+                if annotate and ch_writer_ann is not None:
+                    rgb_ann = rgb.copy()
+                    if center is not None:
+                        rgb_ann = _draw_overlays(
+                            rgb_ann,
+                            center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
+                            track_xy=[
+                                (int(p[0] * upscale), int(p[1] * upscale))
+                                for p in track_by_frame.get(t, [])
+                            ],
+                            circle_r=circle_r * upscale,
+                            line_w=max(1, line_w * upscale),
+                        )
+                    ch_writer_ann.write(cv2.cvtColor(rgb_ann, cv2.COLOR_RGB2BGR))
+
+        writer_raw.release()
+        if writer_ann is not None:
+            writer_ann.release()
+        for _, ch_writer_raw, ch_writer_ann in channel_writers:
+            ch_writer_raw.release()
+            if ch_writer_ann is not None:
+                ch_writer_ann.release()
+
+        print(f"Saved {out_path_raw}")
+        if annotate:
+            print(f"Saved {out_path_ann}")
 
 
 def save_track_movies_mp4(
@@ -375,6 +394,7 @@ def save_track_movies_mp4(
     line_w=2,
     only_track_frames=True,
     pseudocolor_single=False,
+    annotate=True,
 ):
     _save_track_movies_video(
         img_array=img_array,
@@ -393,6 +413,7 @@ def save_track_movies_mp4(
         line_w=line_w,
         only_track_frames=only_track_frames,
         pseudocolor_single=pseudocolor_single,
+        annotate=annotate,
     )
 
 
@@ -411,6 +432,7 @@ def save_track_movies_avi(
     line_w=2,
     only_track_frames=True,
     pseudocolor_single=False,
+    annotate=True,
 ):
     _save_track_movies_video(
         img_array=img_array,
@@ -429,6 +451,7 @@ def save_track_movies_avi(
         line_w=line_w,
         only_track_frames=only_track_frames,
         pseudocolor_single=pseudocolor_single,
+        annotate=annotate,
     )
 
 
@@ -444,21 +467,22 @@ def _collect_layer_meta(viewer):
         pt_meta = _get_pt_meta(ly)
         role = pt_meta.get("role")
 
-        if ly.__class__.__name__ == "Points" and (
-            role == "puncta" or getattr(ly, "name", "") == "Detected puncta"
-        ):
+        if ly.__class__.__name__ == "Points" and role == "puncta":
             pts_layers.append(ly)
 
-        if ly.__class__.__name__ == "Tracks" and (
-            role == "tracks" or getattr(ly, "name", "") == "Tracks"
-        ):
+        if ly.__class__.__name__ == "Tracks" and role == "tracks":
             trk_layers.append(ly)
 
     if pts_layers:
         spot_meta = _get_pt_meta(pts_layers[0]).get("run_params", {})
+        if not spot_meta:
+            # fallback: some versions stored directly on metadata
+            spot_meta = pts_layers[0].metadata.get("run_params", {})
 
     if trk_layers:
         track_meta = _get_pt_meta(trk_layers[0]).get("run_params", {})
+        if not track_meta:
+            track_meta = trk_layers[0].metadata.get("run_params", {})
 
     return spot_meta, track_meta
 
@@ -503,6 +527,7 @@ def save_track_gifs(
     line_w=2,
     only_track_frames=True,
     pseudocolor_single=False,
+    annotate=True,
 ):
     if img_array.ndim != 4:
         raise ValueError(f"Expected (T,C,Y,X), got {img_array.shape}")
@@ -584,7 +609,7 @@ def save_track_gifs(
             comp_raw.append(comp_rgb)
 
             comp_rgb_ann = comp_rgb.copy()
-            if center is not None:
+            if annotate and center is not None:
                 comp_rgb_ann = _draw_overlays(
                     comp_rgb_ann,
                     center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
@@ -603,7 +628,7 @@ def save_track_gifs(
                     raw = _resize_nn(_to_rgb(gray), upscale)
 
                 ann = raw.copy()
-                if center is not None:
+                if annotate and center is not None:
                     ann = _draw_overlays(
                         ann,
                         center_xy=(int(center[0] * upscale), int(center[1] * upscale)),
@@ -616,15 +641,17 @@ def save_track_gifs(
                 single_ann[c].append(ann)
 
         fn_raw = os.path.join(output_dir, f"{base_name}_track{pid}_composite_raw.gif")
-        fn_ann = os.path.join(output_dir, f"{base_name}_track{pid}_composite_annot.gif")
         iio.imwrite(fn_raw, comp_raw, duration=duration, loop=0)
-        iio.imwrite(fn_ann, comp_ann, duration=duration, loop=0)
+        if annotate:
+            fn_ann = os.path.join(output_dir, f"{base_name}_track{pid}_composite_annot.gif")
+            iio.imwrite(fn_ann, comp_ann, duration=duration, loop=0)
 
         for c in range(C):
             fn_ch_raw = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_raw.gif")
-            fn_ch_ann = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_annot.gif")
             iio.imwrite(fn_ch_raw, single_raw[c], duration=duration, loop=0)
-            iio.imwrite(fn_ch_ann, single_ann[c], duration=duration, loop=0)
+            if annotate:
+                fn_ch_ann = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_annot.gif")
+                iio.imwrite(fn_ch_ann, single_ann[c], duration=duration, loop=0)
 
         print(f"Saved gifs for track {pid}")
 
@@ -727,7 +754,8 @@ def kymograph_along_fixed_path(
 
 
 def save_kymos(out_dir, track_id, kymo_ncl, save_float_tif=True,
-               save_png=True, make_rgb=True, png_scale=1, png_bitdepth=8):
+               save_png=True, make_rgb=True, png_scale=1, png_bitdepth=8,
+               channel_colors=None):
     os.makedirs(out_dir, exist_ok=True)
     N, C, L = kymo_ncl.shape
 
@@ -754,11 +782,32 @@ def save_kymos(out_dir, track_id, kymo_ncl, save_float_tif=True,
 
     if make_rgb and C >= 2 and save_png:
         rgb = np.zeros((N, L, 3), dtype=np.uint8)
-        for ch in range(min(C, 3)):
+        for ch in range(C):
             vmin = np.nanpercentile(kymo_ncl[:, ch, :], 1)
             vmax = np.nanpercentile(kymo_ncl[:, ch, :], 99)
-            scaled = np.clip((kymo_ncl[:, ch, :] - vmin) / (vmax - vmin + 1e-12), 0, 1)
-            rgb[..., ch] = (255 * np.nan_to_num(scaled)).astype(np.uint8)
+            scaled = np.clip(
+                (kymo_ncl[:, ch, :] - vmin) / (vmax - vmin + 1e-12), 0, 1
+            )
+            gray = np.nan_to_num(scaled).astype(np.float32)
+
+            if channel_colors is not None and ch in channel_colors:
+                r, g, b = [v / 255.0 for v in channel_colors[ch]]
+            else:
+                # cycle through some distinguishable colors for unmapped channels
+                _fallback = [
+                    (1.0, 0.0, 1.0),  # magenta
+                    (1.0, 0.0, 0.0),  # red
+                    (0.0, 1.0, 0.0),  # green
+                    (0.0, 0.0, 1.0),  # blue
+                    (1.0, 1.0, 0.0),  # yellow
+                    (0.0, 1.0, 1.0),  # cyan
+                ]
+                r, g, b = _fallback[ch % len(_fallback)]
+
+            rgb[..., 0] = np.clip(rgb[..., 0] + gray * r * 255, 0, 255).astype(np.uint8)
+            rgb[..., 1] = np.clip(rgb[..., 1] + gray * g * 255, 0, 255).astype(np.uint8)
+            rgb[..., 2] = np.clip(rgb[..., 2] + gray * b * 255, 0, 255).astype(np.uint8)
+
         if png_scale > 1:
             rgb = np.kron(rgb, np.ones((png_scale, png_scale, 1), dtype=rgb.dtype))
         iio.imwrite(os.path.join(out_dir, f"track_{track_id}_kymo_rgb.png"), rgb)
@@ -768,6 +817,7 @@ def export_all_track_kymographs_from_array(
     img_array, tracks_df, out_root, image_name,
     L=200, W=9, width_reduce="mean", min_len=3,
     include_all_frames=False, frame_base=0,
+    channel_colors=None,
 ):
     validate_tracks_df(tracks_df)
     if img_array.ndim == 3:
@@ -802,7 +852,7 @@ def export_all_track_kymographs_from_array(
         save_kymos(
             out_dir=out_dir, track_id=pid, kymo_ncl=kymo,
             save_float_tif=True, save_png=True, make_rgb=True,
-            png_scale=3, png_bitdepth=8
+            png_scale=3, png_bitdepth=8, channel_colors=channel_colors,
         )
         meta = g[["frame", "x", "y"]].copy()
         meta["frame_0based"] = frames_track
@@ -891,6 +941,9 @@ class ExportWidget(QWidget):
         movie_layout.addWidget(self.fps)
         movie_layout.addWidget(QLabel("Upscale"))
         movie_layout.addWidget(self.upscale)
+        self.annotate = QCheckBox("Draw track overlays (circle + path)")
+        self.annotate.setChecked(True)
+        movie_layout.addWidget(self.annotate)
         self.pseudocolor_single = QCheckBox("Pseudocolor single-channel movies")
         self.pseudocolor_single.setChecked(False)
         movie_layout.addWidget(self.pseudocolor_single)
@@ -1075,6 +1128,7 @@ class ExportWidget(QWidget):
                 only_track_frames=self.only_track_frames.isChecked(),
                 channel_colors=channel_colors,
                 pseudocolor_single=self.pseudocolor_single.isChecked(),
+                annotate=self.annotate.isChecked(),
             )
 
             if fmt == "MP4":
@@ -1100,6 +1154,7 @@ class ExportWidget(QWidget):
                 img_array=arr, tracks_df=df, out_root=out_dir,
                 image_name=image_name, L=200, W=9,
                 width_reduce="mean", include_all_frames=False, frame_base=0,
+                channel_colors=self._get_channel_colors(),
             )
             show_info("Kymograph export complete.")
         except Exception as e:

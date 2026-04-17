@@ -489,28 +489,30 @@ class TracksListWidget(QWidget):
                 # Show
                 show_btn = QPushButton("Show")
                 show_btn.setMaximumWidth(55); show_btn.setMaximumHeight(25)
+                show_btn.setStyleSheet("QPushButton { font-weight: bold; }")
                 show_btn.clicked.connect(partial(self.on_show_clicked, int(pid)))
                 self.table.setCellWidget(row_idx, 3, centered_cell_widget(show_btn))
 
                 # Keep
                 keep_btn = QPushButton("Keep")
                 keep_btn.setMaximumWidth(55); keep_btn.setMaximumHeight(25)
-                keep_btn.setStyleSheet("QPushButton { color: green; font-weight: bold; }")
+                keep_btn.setStyleSheet("QPushButton { background-color: green; font-weight: bold; }")
                 keep_btn.clicked.connect(partial(self.on_keep_clicked, int(pid)))
                 self.table.setCellWidget(row_idx, 4, centered_cell_widget(keep_btn))
-
-                # Delete
-                del_btn = QPushButton("Delete")
-                del_btn.setMaximumWidth(55); del_btn.setMaximumHeight(25)
-                del_btn.setStyleSheet("QPushButton { color: red; }")
-                del_btn.clicked.connect(partial(self.on_delete_clicked, int(pid)))
-                self.table.setCellWidget(row_idx, 5, centered_cell_widget(del_btn))
 
                 # Edit
                 edit_btn = QPushButton("Edit")
                 edit_btn.setMaximumWidth(55); edit_btn.setMaximumHeight(25)
+                edit_btn.setStyleSheet("QPushButton { font-weight: bold; }")
                 edit_btn.clicked.connect(partial(self._on_edit_clicked, int(pid)))
-                self.table.setCellWidget(row_idx, 6, centered_cell_widget(edit_btn))
+                self.table.setCellWidget(row_idx, 5, centered_cell_widget(edit_btn))
+
+                # Delete
+                del_btn = QPushButton("Delete")
+                del_btn.setMaximumWidth(55); del_btn.setMaximumHeight(25)
+                del_btn.setStyleSheet("QPushButton { background-color: red; }")
+                del_btn.clicked.connect(partial(self.on_delete_clicked, int(pid)))
+                self.table.setCellWidget(row_idx, 6, centered_cell_widget(del_btn))
 
             if self.table.rowCount() > 0:
                 self.table.selectRow(0)

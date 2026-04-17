@@ -13,6 +13,8 @@ from ._helpers import tracks_layer_to_dataframe, dataframe_to_tracks_layer_data
 from ._export import ExportWidget
 from ._validation_state import get_or_create_validation_state, init_validation_from_tracks
 
+_TRACKS_LIST_WIDGETS: dict[int, TracksListWidget] = {}
+
 # keep the layer dropdowns fresh
 def _refresh_layer_choices(*_):
     try:
@@ -108,11 +110,8 @@ def make_plugin_gui(viewer=None, **_):
                 return
             df = tracks_layer_to_dataframe(tracks_layers[0])
             init_validation_from_tracks(viewer, df)
-        try:
-            qt_win = viewer.window._qt_window
-        except Exception:
-            qt_win = viewer.window
-        existing = getattr(qt_win, "_tracks_list_widget", None)
+        vid = id(viewer)
+        existing = _TRACKS_LIST_WIDGETS.get(vid)
         widget_alive = (
             existing is not None
             and hasattr(existing, "isVisible")
@@ -123,7 +122,7 @@ def make_plugin_gui(viewer=None, **_):
             return
         widget = TracksListWidget(viewer=viewer)
         viewer.window.add_dock_widget(widget, name="Tracks List", area="right")
-        setattr(qt_win, "_tracks_list_widget", widget)
+        _TRACKS_LIST_WIDGETS[vid] = widget
         widget.track_kept.connect(
             lambda: validated_table.__setattr__(
                 "dataframe", get_or_create_validation_state(viewer).kept_df
@@ -139,11 +138,7 @@ def make_plugin_gui(viewer=None, **_):
             if state.is_empty:
                 df = tracks_layer_to_dataframe(layer)
                 init_validation_from_tracks(viewer, df)
-            try:
-                existing = viewer.window._qt_window._tracks_list_widget
-            except Exception:
-                existing = getattr(getattr(viewer.window, "_qt_window", viewer.window),
-                                   "_tracks_list_widget", None)
+            existing = _TRACKS_LIST_WIDGETS.get(id(viewer))
             if existing is not None and hasattr(existing, "isVisible") and existing.isVisible():
                 existing.refresh_from_state()
 
