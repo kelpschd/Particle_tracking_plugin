@@ -5,7 +5,7 @@ from magicgui.widgets import Container, Label
 from napari import current_viewer
 from napari.utils.notifications import show_warning
 
-from ._widget import particle_detection_widget
+from ._widget import DetectionWidget
 from ._tracking_widget import tracking_widget, TracksListWidget
 from ._image_import_widget import ImageImportWidget
 from .tracks_table_widget import TracksTableWidget
@@ -15,47 +15,35 @@ from ._validation_state import get_or_create_validation_state, init_validation_f
 
 _TRACKS_LIST_WIDGETS: dict[int, TracksListWidget] = {}
 
-# keep the layer dropdowns fresh
-def _refresh_layer_choices(*_):
-    try:
-        particle_detection_widget.reset_choices()
-    except Exception:
-        pass
-    try:
-        tracking_widget.reset_choices()
-    except Exception:
-        pass
 
 def make_plugin_gui(viewer=None, **_):
     viewer = viewer or current_viewer()
-    state = get_or_create_validation_state(viewer)
+    get_or_create_validation_state(viewer)
 
-    particle_detection_widget.viewer.value = viewer
-    tracking_widget.viewer.value = viewer 
+    tracking_widget.viewer.value = viewer
 
     tabs = QTabWidget()
     tabs.setTabPosition(QTabWidget.North)
 
-    # Import page
+    # --- Import tab ---
     import_page = QWidget()
     imp_layout = QVBoxLayout(import_page)
     imp_layout.setContentsMargins(0, 0, 0, 0)
     imp_layout.setSpacing(0)
-    import_widget = ImageImportWidget(viewer=viewer) 
-    import_widget.layers_loaded.connect(_refresh_layer_choices)
+    import_widget = ImageImportWidget(viewer=viewer)
     imp_layout.addWidget(import_widget)
     tabs.addTab(import_page, "Import")
 
-    # Detection page
+    # --- Detection tab ---
     detection_page = QWidget()
     det_layout = QVBoxLayout(detection_page)
     det_layout.setContentsMargins(0, 0, 0, 0)
     det_layout.setSpacing(0)
-    det_layout.addWidget(particle_detection_widget.native)
-    det_layout.addStretch(1)
+    detection_widget = DetectionWidget(viewer=viewer)
+    det_layout.addWidget(detection_widget)
     tabs.addTab(detection_page, "Detection")
 
-    # Tracking page
+    # --- Tracking tab ---
     tracking_page = QWidget()
     trk_layout = QVBoxLayout(tracking_page)
     trk_layout.setContentsMargins(0, 0, 0, 0)
@@ -70,14 +58,14 @@ def make_plugin_gui(viewer=None, **_):
     trk_layout.addStretch(1)
     tabs.addTab(tracking_page, "Tracking")
 
-    # Validated tracks page
+    # --- Validated tracks tab ---
     validated_page = QWidget()
     val_layout = QVBoxLayout(validated_page)
     val_layout.setContentsMargins(0, 0, 0, 0)
     val_layout.setSpacing(0)
     val_layout.addWidget(QLabel("Validated (kept) tracks"))
 
-    state = get_or_create_validation_state(viewer) 
+    state = get_or_create_validation_state(viewer)
     validated_table = TracksTableWidget(
         viewer=viewer,
         tracks_layer=None,
@@ -86,7 +74,7 @@ def make_plugin_gui(viewer=None, **_):
     val_layout.addWidget(validated_table)
     tabs.addTab(validated_page, "Validated Tracks")
 
-    # Export tab
+    # --- Export tab ---
     export_page = QWidget()
     exp_layout = QVBoxLayout(export_page)
     exp_layout.setContentsMargins(0, 0, 0, 0)
@@ -98,6 +86,7 @@ def make_plugin_gui(viewer=None, **_):
     exp_layout.addWidget(export_widget)
     tabs.addTab(export_page, "Export")
 
+    # --- Tracks list singleton ---
     def _open_tracks_list_singleton():
         state = get_or_create_validation_state(viewer)
         if state.is_empty:
@@ -131,6 +120,7 @@ def make_plugin_gui(viewer=None, **_):
 
     open_tracks_list_btn.clicked.connect(_open_tracks_list_singleton)
 
+    # --- Layer event hooks ---
     def _on_layer_inserted(event):
         layer = event.value
         if layer.__class__.__name__ == "Tracks":
@@ -142,12 +132,16 @@ def make_plugin_gui(viewer=None, **_):
             if existing is not None and hasattr(existing, "isVisible") and existing.isVisible():
                 existing.refresh_from_state()
 
-    viewer.layers.events.inserted.connect(_on_layer_inserted)
-    viewer.layers.events.inserted.connect(_refresh_layer_choices)
-    viewer.layers.events.removed.connect(_refresh_layer_choices)
-    viewer.layers.events.reordered.connect(_refresh_layer_choices)
-    viewer.layers.events.changed.connect(_refresh_layer_choices)
+    def _refresh_tracking_choices(*_):
+        try:
+            tracking_widget.reset_choices()
+        except Exception:
+            pass
 
-    _refresh_layer_choices()
+    viewer.layers.events.inserted.connect(_on_layer_inserted)
+    viewer.layers.events.inserted.connect(_refresh_tracking_choices)
+    viewer.layers.events.removed.connect(_refresh_tracking_choices)
+    viewer.layers.events.reordered.connect(_refresh_tracking_choices)
+    viewer.layers.events.changed.connect(_refresh_tracking_choices)
 
     return tabs

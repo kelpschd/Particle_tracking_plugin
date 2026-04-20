@@ -1,290 +1,354 @@
 # _widget.py
 from __future__ import annotations
-from typing import Optional
-from napari.layers import Points
-from napari.layers import Image as NapariImage
-from magicgui import magicgui
+
 import numpy as np
 import pandas as pd
+
+from qtpy.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QGroupBox, QCheckBox, QDoubleSpinBox, QSpinBox, QComboBox,
+    QFormLayout,
+)
+from qtpy.QtCore import Qt
+
 from napari.utils.notifications import show_info, show_warning, show_error
 from napari.qt.threading import thread_worker
 
 from ._processing import (
     preprocess_stack_single_channel,
     detect_puncta_dask,
-    filter_dense_blobs
+    filter_dense_blobs,
 )
 from ._helpers import pt_meta_dict, layer_name, image_root_from_path
 
-def _get_active_image_layer_data(viewer):
-    if viewer is None:
-        return None
-    lay = getattr(viewer.layers.selection, "active", None)
-    if getattr(lay, "__class__", None) and lay.__class__.__name__ == "Image":
-        return lay.data
-    for L in viewer.layers:
-        if L.__class__.__name__ == "Image":
-            return L.data
-    return None
 
-# Particle detection UI
-@magicgui(
-    call_button="Run",
-    layout="vertical",
-    img_stack={"label": "Input time series"},
-    show_preprocessed={"label": "Show preprocessed image series"},
-    median_filter_size={"min": 1, "max": 101, "step": 1},
-    threshold={"label": "threshold", "min": 0.0, "max": 0.01, "step": 0.00001},
-    min_sigma={"min": 0.1, "max": 20.0, "step": 0.1},
-    max_sigma={"min": 0.1, "max": 40.0, "step": 0.1},
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    enable_density_filter={"label": "Enable density filter"},
-    bin_size={"label": "Bin size (px)", "min": 1, "max": 256, "step": 1},
-    blob_filter={"label": "Max blobs per bin", "min": 1, "max": 10000, "step": 1},
-)
+def _image_layers(viewer):
+    """Return list of (name, layer) for all Image layers in the viewer."""
+    return [
+        ly for ly in viewer.layers
+        if ly.__class__.__name__ == "Image"
+    ]
 
-def particle_detection_widget(
-    viewer: "napari.viewer.Viewer",
-    img_stack: "napari.types.ImageData" = None,   # (t,y,x)
-    show_preprocessed: bool = False,
-    median_filter_size: int = 10,
-    threshold: float = 0.00012,
-    min_sigma: float = 1.0,
-    max_sigma: float = 3.0,
 
-    enable_density_filter: bool = False,
-    bin_size: int = 5,
-    blob_filter: int = 10,
-):
-    """Detect puncta from a 3D single-channel stack (t,y,x) and optionally filter densely clustered blobs."""
+def _array_from_layer(layer):
+    """Extract a (t, y, x) numpy array from a napari Image layer."""
+    import dask.array as da
+    arr = layer.data
+    if isinstance(arr, da.Array):
+        arr = arr.compute()
+    arr = np.asarray(arr)
 
-    def _resolve_img_stack(img_stack, viewer):
-        from napari.utils.notifications import show_warning
+    if arr.ndim == 2:
+        return arr[np.newaxis]
+    if arr.ndim == 3:
+        return arr
+    if arr.ndim == 4:
+        # (t, c, y, x) — take channel 0
+        show_warning(f"Layer '{layer.name}' is 4D; using channel 0.")
+        return arr[:, 0]
+    raise ValueError(f"Cannot use layer with shape {arr.shape} for detection.")
 
-        # unwrap magicgui parameter wrapper
+
+def _pt_meta_from_layer(layer):
+    meta = getattr(layer, "metadata", {}) or {}
+    return meta.get("particle_tracking", {}) or {}
+
+
+# ---------------------------------------------------------------------------
+# Main widget
+# ---------------------------------------------------------------------------
+
+class DetectionWidget(QWidget):
+    def __init__(self, viewer, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self._build_ui()
+        self._connect_layer_events()
+        self._refresh_layer_combos()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        layout.addWidget(self._build_preprocess_group())
+        layout.addWidget(self._build_detection_group())
+        layout.addStretch(1)
+
+    # --- Preprocessing group -------------------------------------------
+
+    def _build_preprocess_group(self):
+        group = QGroupBox("Preprocessing (optional)")
+        form = QFormLayout(group)
+        form.setLabelAlignment(Qt.AlignLeft)
+        form.setSpacing(4)
+
+        self.pre_layer_combo = QComboBox()
+        form.addRow("Input layer", self.pre_layer_combo)
+
+        self.median_filter_size = QSpinBox()
+        self.median_filter_size.setRange(1, 101)
+        self.median_filter_size.setSingleStep(1)
+        self.median_filter_size.setValue(10)
+        form.addRow("Median filter size", self.median_filter_size)
+
+        run_pre_btn = QPushButton("Run preprocessing")
+        run_pre_btn.clicked.connect(self._on_run_preprocessing)
+        form.addRow(run_pre_btn)
+
+        return group
+
+    # --- Detection group -----------------------------------------------
+
+    def _build_detection_group(self):
+        group = QGroupBox("Spot detection")
+        form = QFormLayout(group)
+        form.setLabelAlignment(Qt.AlignLeft)
+        form.setSpacing(4)
+
+        self.det_layer_combo = QComboBox()
+        form.addRow("Input layer", self.det_layer_combo)
+
+        self.threshold = QDoubleSpinBox()
+        self.threshold.setRange(0.0, 0.01)
+        self.threshold.setSingleStep(0.00001)
+        self.threshold.setDecimals(6)
+        self.threshold.setValue(0.00012)
+        form.addRow("Threshold", self.threshold)
+
+        self.min_sigma = QDoubleSpinBox()
+        self.min_sigma.setRange(0.1, 20.0)
+        self.min_sigma.setSingleStep(0.1)
+        self.min_sigma.setDecimals(1)
+        self.min_sigma.setValue(1.0)
+        form.addRow("Min sigma", self.min_sigma)
+
+        self.max_sigma = QDoubleSpinBox()
+        self.max_sigma.setRange(0.1, 40.0)
+        self.max_sigma.setSingleStep(0.1)
+        self.max_sigma.setDecimals(1)
+        self.max_sigma.setValue(3.0)
+        form.addRow("Max sigma", self.max_sigma)
+
+        # Density filter
+        self.enable_density_filter = QCheckBox("Enable density filter")
+        self.enable_density_filter.setChecked(False)
+        form.addRow(self.enable_density_filter)
+
+        self.bin_size_label = QLabel("Bin size (px)")
+        self.bin_size = QSpinBox()
+        self.bin_size.setRange(1, 256)
+        self.bin_size.setValue(5)
+        form.addRow(self.bin_size_label, self.bin_size)
+
+        self.blob_filter_label = QLabel("Max blobs per bin")
+        self.blob_filter = QSpinBox()
+        self.blob_filter.setRange(1, 10000)
+        self.blob_filter.setValue(10)
+        form.addRow(self.blob_filter_label, self.blob_filter)
+
+        self._set_density_filter_visible(False)
+        self.enable_density_filter.toggled.connect(self._set_density_filter_visible)
+
+        run_det_btn = QPushButton("Run detection")
+        run_det_btn.clicked.connect(self._on_run_detection)
+        form.addRow(run_det_btn)
+
+        return group
+
+    def _set_density_filter_visible(self, visible):
+        self.bin_size_label.setVisible(visible)
+        self.bin_size.setVisible(visible)
+        self.blob_filter_label.setVisible(visible)
+        self.blob_filter.setVisible(visible)
+
+    # ------------------------------------------------------------------
+    # Layer combo management
+    # ------------------------------------------------------------------
+
+    def _connect_layer_events(self):
+        self.viewer.layers.events.inserted.connect(self._refresh_layer_combos)
+        self.viewer.layers.events.removed.connect(self._refresh_layer_combos)
+        self.viewer.layers.events.reordered.connect(self._refresh_layer_combos)
+
+    def _refresh_layer_combos(self, event=None):
+        names = [ly.name for ly in _image_layers(self.viewer)]
+
+        for combo in (self.pre_layer_combo, self.det_layer_combo):
+            prev = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            # restore previous selection if still present
+            idx = combo.findText(prev)
+            combo.setCurrentIndex(max(idx, 0))
+            combo.blockSignals(False)
+
+    def _get_layer(self, combo):
+        """Return the napari layer currently selected in a combo, or None."""
+        name = combo.currentText()
+        if not name:
+            return None
         try:
-            if hasattr(img_stack, "value"):
-                img_stack = img_stack.value
-        except Exception:
-            pass
+            return self.viewer.layers[name]
+        except KeyError:
+            return None
 
-        # If nothing selected, try active image layer
-        if img_stack is None:
-            candidate = _get_active_image_layer_data(viewer)
-            if candidate is None:
-                return None
-            arr = candidate
-        else:
-            # If a string layer name
-            if isinstance(img_stack, str):
-                layer = None
-                try:
-                    layer = viewer.layers[img_stack]
-                except Exception:
-                    for ly in viewer.layers:
-                        if getattr(ly, "name", None) == img_stack:
-                            layer = ly
-                            break
-                if layer is None:
-                    print(f"_resolve_img_stack: no layer named {img_stack!r}")
-                    return None
-                arr = getattr(layer, "data", None)
+    # ------------------------------------------------------------------
+    # Preprocessing
+    # ------------------------------------------------------------------
 
-            # If napari Image layer
-            elif hasattr(img_stack, "data"):
-                arr = img_stack.data
+    def _on_run_preprocessing(self):
+        layer = self._get_layer(self.pre_layer_combo)
+        if layer is None:
+            show_warning("No image layer selected for preprocessing.")
+            return
 
-            else:
-                arr = img_stack
-
-        # Handle dask / lazy arrays
         try:
-            import dask.array as da
-            if isinstance(arr, da.Array):
-                arr = arr.compute()
-        except Exception:
-            pass
+            arr = _array_from_layer(layer)
+        except ValueError as e:
+            show_error(str(e))
+            return
 
-        # Convert to numpy
+        mf_size = self.median_filter_size.value()
+
         try:
-            arr = np.asarray(arr)
+            pre = preprocess_stack_single_channel(arr, median_filter_size=mf_size)
         except Exception as e:
-            print("_resolve_img_stack: np.asarray failed:", e)
-            return None
+            show_error(f"Preprocessing failed: {e}")
+            return
 
-        if arr.size == 0:
-            print("_resolve_img_stack: array has size 0")
-            return None
-
-        # 2D → treat as single frame
-        if arr.ndim == 2:
-            arr = arr[np.newaxis, ...]
-
-        # 3D → expected case
-        if arr.ndim == 3:
-            return arr
-
-        # 4D → assume (t, c, y, x) → pick channel 0
-        if arr.ndim == 4:
-            if arr.shape[1] <= 8:
-                show_warning(f"Input shape {arr.shape} looks like (t,c,y,x). Using channel 0.")
-                return arr[:, 0, ...]
-            raise ValueError(f"Ambiguous 4D shape {arr.shape}")
-
-        raise ValueError(f"Expected 3D (t,y,x); got {arr.shape}")
-
-    # Resolve input
-    try:
-        arr = _resolve_img_stack(img_stack, viewer)
-    except ValueError as e:
-        show_warning(str(e))
-        return
-
-    if arr is None:
-        show_info("Select an Image layer in 'Input time series' first.")
-        return
-
-    print("particle_detection resolved array:", type(arr), arr.shape)
-
-    # # Auto-select the active image layer if none selected
-    # if img_stack is None:
-    #     img_stack = _get_active_image_layer_data(viewer)
-    #     if img_stack is None:
-    #         show_info("Select an Image layer in 'Input time series' first.")
-    #         return
-
-    # arr = np.asarray(img_stack)
-    # if arr.ndim != 3:
-    #     show_warning(f"Expected 3D (t,y,x); got {arr.shape}.")
-    #     return
-
-    # --- Preprocess once (NumPy; fast) ---
-    try:
-        pre = preprocess_stack_single_channel(arr, median_filter_size=median_filter_size)
-    except Exception as e:
-        show_error(f"Preprocessing failed: {e}")
-        return
-
-    if show_preprocessed:
-        active_layer = viewer.layers.selection.active
-
-        meta = getattr(active_layer, "metadata", {})
-        pt_meta = meta.get("particle_tracking", {})
-
-        image_root = pt_meta.get("image_root")
+        pt_meta = _pt_meta_from_layer(layer)
+        image_root = pt_meta.get("image_root") or image_root_from_path(
+            pt_meta.get("image_path", layer.name)
+        )
         channel_label = pt_meta.get("channel_label")
-
         name = layer_name(image_root, channel_label, "preprocessed")
 
-        viewer.add_image(
+        self.viewer.add_image(
             pre,
             name=name,
             rgb=False,
             metadata=pt_meta_dict(
                 role="preprocessed",
-                source_layer=active_layer.name,
+                source_layer=layer.name,
                 image_root=image_root,
                 channel_label=channel_label,
             ),
         )
+        show_info(f"Preprocessing complete → '{name}'")
 
-    # --- Detect off the UI thread ---
-    @thread_worker
-    def _run_detection(pre_stack, thr, smin, smax):
-        return detect_puncta_dask(
-            pre_stack,
-            threshold=thr,
-            min_sigma=smin,
-            max_sigma=smax,
+    # ------------------------------------------------------------------
+    # Detection
+    # ------------------------------------------------------------------
+
+    def _on_run_detection(self):
+        layer = self._get_layer(self.det_layer_combo)
+        if layer is None:
+            show_warning("No image layer selected for detection.")
+            return
+
+        try:
+            arr = _array_from_layer(layer)
+        except ValueError as e:
+            show_error(str(e))
+            return
+
+        # snapshot params
+        threshold  = self.threshold.value()
+        min_sigma  = self.min_sigma.value()
+        max_sigma  = self.max_sigma.value()
+        use_filter = self.enable_density_filter.isChecked()
+        bin_size   = self.bin_size.value()
+        blob_filter = self.blob_filter.value()
+
+        pt_meta = _pt_meta_from_layer(layer)
+        image_root = pt_meta.get("image_root") or image_root_from_path(
+            pt_meta.get("image_path", layer.name)
         )
-
-    worker = _run_detection(pre, threshold, min_sigma, max_sigma)
-
-    def _on_error(err):
-        show_error(f"Detection failed: {err}")
-
-    def _on_done(det_df: pd.DataFrame):
-        if det_df is None or len(det_df) == 0:
-            show_info("No puncta detected with current parameters.")
-            return
-
-        n_before = len(det_df)
-        if enable_density_filter:
-            try:
-                det_df = filter_dense_blobs(det_df, bin_size=bin_size, blob_filter=blob_filter)
-            except Exception as e:
-                show_warning(f"Density filtering skipped (error: {e}).")
-        n_after = len(det_df)
-
-        if n_after == 0:
-            show_info("All puncta were filtered out by density settings.")
-            return
-
-        points_data = det_df[["frame", "y", "x"]].to_numpy()
-        props = {}
-        if "size" in det_df.columns:
-            props["size"] = det_df["size"].to_numpy()
-
-        run_spot_meta = {
-            "median_filter_size": int(median_filter_size),
-            "threshold": float(threshold),
-            "min_sigma": float(min_sigma),
-            "max_sigma": float(max_sigma),
-            "enable_density_filter": bool(enable_density_filter),
-            "bin_size": int(bin_size),
-            "blob_filter": int(blob_filter),
-            "n_detected_before_filter": int(n_before),
-            "n_detected_after_filter": int(n_after),
-        }
-
-        active_layer = viewer.layers.selection.active
-        meta = getattr(active_layer, "metadata", {}) or {}
-        pt_meta = meta.get("particle_tracking", {}) or {}
-
-        image_root = pt_meta.get("image_root")
         channel_label = pt_meta.get("channel_label")
+        source_name = layer.name
 
-        puncta_name = layer_name(image_root, channel_label, "puncta")
+        @thread_worker
+        def _run(stack, thr, smin, smax):
+            return detect_puncta_dask(stack, threshold=thr, min_sigma=smin, max_sigma=smax)
 
-        pts_layer = viewer.add_points(
-            points_data,
-            name=puncta_name,
-            size=30,
-            face_color="transparent",
-            properties=props,
-            border_color="red",
-            border_width=0.1,
-        )
+        worker = _run(arr, threshold, min_sigma, max_sigma)
 
-        pts_layer.metadata["run_params"] = run_spot_meta
-        pts_layer.metadata["particle_tracking"] = {
-            **pt_meta,
-            "role": "puncta",
-            "run_params": run_spot_meta,
-            "image_root": image_root,
-            "channel_label": channel_label,
-            "source_layer": getattr(active_layer, "name", None),
-        }
+        def _on_error(err):
+            show_error(f"Detection failed: {err}")
 
-        if enable_density_filter:
-            show_info(f"Puncta detection complete: {n_after} remain (from {n_before}) after density filter.")
-        else:
-            show_info(f"Puncta detection complete: {n_after} total.")
+        def _on_done(det_df: pd.DataFrame):
+            if det_df is None or len(det_df) == 0:
+                show_info("No puncta detected with current parameters.")
+                return
 
-    worker.errored.connect(_on_error)
-    worker.returned.connect(_on_done)
-    worker.start()
+            n_before = len(det_df)
+            if use_filter:
+                try:
+                    det_df = filter_dense_blobs(
+                        det_df, bin_size=bin_size, blob_filter=blob_filter
+                    )
+                except Exception as e:
+                    show_warning(f"Density filtering skipped: {e}")
+            n_after = len(det_df)
 
+            if n_after == 0:
+                show_info("All puncta filtered out by density settings.")
+                return
 
-def _wire_density_filter_controls(func_gui):
-    """Show/hide density filter params when the toggle changes."""
-    # default visibility
-    func_gui.bin_size.visible = func_gui.enable_density_filter.value
-    func_gui.blob_filter.visible = func_gui.enable_density_filter.value
+            points_data = det_df[["frame", "y", "x"]].to_numpy()
+            props = {}
+            if "size" in det_df.columns:
+                props["size"] = det_df["size"].to_numpy()
 
-    @func_gui.enable_density_filter.changed.connect
-    def _toggle(_event=None):
-        vis = func_gui.enable_density_filter.value
-        func_gui.bin_size.visible = vis
-        func_gui.blob_filter.visible = vis
+            run_params = {
+                "median_filter_size":       self.median_filter_size.value(),
+                "threshold":                float(threshold),
+                "min_sigma":                float(min_sigma),
+                "max_sigma":                float(max_sigma),
+                "enable_density_filter":    bool(use_filter),
+                "bin_size":                 int(bin_size),
+                "blob_filter":              int(blob_filter),
+                "n_detected_before_filter": int(n_before),
+                "n_detected_after_filter":  int(n_after),
+            }
 
+            puncta_name = layer_name(image_root, channel_label, "puncta")
+            pts_layer = self.viewer.add_points(
+                points_data,
+                name=puncta_name,
+                size=30,
+                face_color="transparent",
+                properties=props,
+                border_color="red",
+                border_width=0.1,
+            )
+            pts_layer.metadata["run_params"] = run_params
+            pts_layer.metadata["particle_tracking"] = {
+                **pt_meta,
+                "role":          "puncta",
+                "run_params":    run_params,
+                "image_root":    image_root,
+                "channel_label": channel_label,
+                "source_layer":  source_name,
+            }
+
+            msg = (
+                f"Detection complete: {n_after} puncta"
+                + (f" (filtered from {n_before})" if use_filter else "")
+                + f" → '{puncta_name}'"
+            )
+            show_info(msg)
+
+        worker.errored.connect(_on_error)
+        worker.returned.connect(_on_done)
+        worker.start()
