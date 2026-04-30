@@ -24,7 +24,12 @@ dependencies = [
   "magicgui>=0.4",
   "shapely>=2.0",
   "trackpy>=0.6",
-  "filterpy>=1.4.5"
+  "filterpy>=1.4.5",
+  "nd2>=0.7",
+  "tifffile>=2023.1.23",
+  "czifile>=2019.7.2",
+  "readlif>=0.6.5",
+  "oiffile>=2023.8.30",
 ]
 
 # Entry point for napari to find your plugin's manifest
