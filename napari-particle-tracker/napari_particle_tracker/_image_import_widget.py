@@ -132,7 +132,7 @@ _WAVELENGTH_RGB = [
     (580, (1.0,  1.0,  0.0 )),   # yellow
     (620, (1.0,  0.5,  0.0 )),   # orange
     (700, (1.0,  0.0,  0.0 )),   # red
-    (800, (0.6,  0.0,  0.0 )),   # deep red / NIR
+    (800, (0.6,  0.0,  0.0 )),   # far red
 ]
 
 def _wavelength_to_rgb(nm):

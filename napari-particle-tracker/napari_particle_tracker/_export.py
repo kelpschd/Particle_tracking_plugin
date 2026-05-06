@@ -250,6 +250,10 @@ def _save_track_movies_video(
         if y2 <= y1 or x2 <= x1:
             continue
 
+        # Create per-particle subdirectory
+        particle_dir = os.path.join(output_dir, f"particle_{pid}")
+        os.makedirs(particle_dir, exist_ok=True)
+
         crop = img_array[:, :, y1:y2, x1:x2]
         crop_norm = normalize_crop_percentile(crop, lower=norm_lower, upper=norm_upper)
         h, w = crop_norm.shape[2], crop_norm.shape[3]
@@ -275,7 +279,7 @@ def _save_track_movies_video(
             track_by_frame[t] = path_so_far.copy()
 
         # composite writers — always write raw, also write annotated if annotate=True
-        out_path_raw = os.path.join(output_dir, f"{base_name}_track{pid}_composite_raw{ext}")
+        out_path_raw = os.path.join(particle_dir, f"{base_name}_track{pid}_composite_raw{ext}")
         writer_raw = cv2.VideoWriter(
             out_path_raw, cv2.VideoWriter_fourcc(*fourcc),
             fps, (w * upscale, h * upscale), isColor=True,
@@ -285,7 +289,7 @@ def _save_track_movies_video(
 
         writer_ann = None
         if annotate:
-            out_path_ann = os.path.join(output_dir, f"{base_name}_track{pid}_composite_annot{ext}")
+            out_path_ann = os.path.join(particle_dir, f"{base_name}_track{pid}_composite_annot{ext}")
             writer_ann = cv2.VideoWriter(
                 out_path_ann, cv2.VideoWriter_fourcc(*fourcc),
                 fps, (w * upscale, h * upscale), isColor=True,
@@ -296,7 +300,7 @@ def _save_track_movies_video(
         # single-channel writers — same pattern
         channel_writers = []
         for c in range(C):
-            ch_out_raw = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_raw{ext}")
+            ch_out_raw = os.path.join(particle_dir, f"{base_name}_track{pid}_ch{c}_raw{ext}")
             ch_writer_raw = cv2.VideoWriter(
                 ch_out_raw, cv2.VideoWriter_fourcc(*fourcc),
                 fps, (w * upscale, h * upscale), isColor=True,
@@ -306,7 +310,7 @@ def _save_track_movies_video(
 
             ch_writer_ann = None
             if annotate:
-                ch_out_ann = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_annot{ext}")
+                ch_out_ann = os.path.join(particle_dir, f"{base_name}_track{pid}_ch{c}_annot{ext}")
                 ch_writer_ann = cv2.VideoWriter(
                     ch_out_ann, cv2.VideoWriter_fourcc(*fourcc),
                     fps, (w * upscale, h * upscale), isColor=True,
@@ -563,6 +567,10 @@ def save_track_gifs(
         if y2 <= y1 or x2 <= x1:
             continue
 
+        # Create per-particle subdirectory
+        particle_dir = os.path.join(output_dir, f"particle_{pid}")
+        os.makedirs(particle_dir, exist_ok=True)
+
         crop = img_array[:, :, y1:y2, x1:x2]
         crop_norm = normalize_crop_percentile(crop, lower=norm_lower, upper=norm_upper)
         h, w = crop_norm.shape[2], crop_norm.shape[3]
@@ -640,17 +648,17 @@ def save_track_gifs(
                 single_raw[c].append(raw)
                 single_ann[c].append(ann)
 
-        fn_raw = os.path.join(output_dir, f"{base_name}_track{pid}_composite_raw.gif")
+        fn_raw = os.path.join(particle_dir, f"{base_name}_track{pid}_composite_raw.gif")
         iio.imwrite(fn_raw, comp_raw, duration=duration, loop=0)
         if annotate:
-            fn_ann = os.path.join(output_dir, f"{base_name}_track{pid}_composite_annot.gif")
+            fn_ann = os.path.join(particle_dir, f"{base_name}_track{pid}_composite_annot.gif")
             iio.imwrite(fn_ann, comp_ann, duration=duration, loop=0)
 
         for c in range(C):
-            fn_ch_raw = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_raw.gif")
+            fn_ch_raw = os.path.join(particle_dir, f"{base_name}_track{pid}_ch{c}_raw.gif")
             iio.imwrite(fn_ch_raw, single_raw[c], duration=duration, loop=0)
             if annotate:
-                fn_ch_ann = os.path.join(output_dir, f"{base_name}_track{pid}_ch{c}_annot.gif")
+                fn_ch_ann = os.path.join(particle_dir, f"{base_name}_track{pid}_ch{c}_annot.gif")
                 iio.imwrite(fn_ch_ann, single_ann[c], duration=duration, loop=0)
 
         print(f"Saved gifs for track {pid}")

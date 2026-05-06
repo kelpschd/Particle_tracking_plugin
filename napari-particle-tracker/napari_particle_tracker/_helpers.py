@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 from vispy.color import Colormap
 import os
+import numpy as np
+from napari.utils.notifications import show_warning
 
 PT_META_KEY = "particle_tracking"
 
@@ -228,3 +230,37 @@ def dataframe_to_tracks_layer_data(df: pd.DataFrame):
                 properties[k] = np.repeat(np.nan, data.shape[0])
 
     return data, properties
+
+def image_layers(viewer):
+    """Return list of Image layers in the viewer."""
+    return [ly for ly in viewer.layers if ly.__class__.__name__ == "Image"]
+
+
+def array_from_layer(layer):
+    """
+    Extract a (t, y, x) numpy array from a napari Image layer.
+    Handles dask arrays, 2D, 3D, and 4D inputs.
+    Raises ValueError for unsupported shapes.
+    """
+    import dask.array as da
+    from napari.utils.notifications import show_warning
+
+    arr = layer.data
+    if isinstance(arr, da.Array):
+        arr = arr.compute()
+    arr = np.asarray(arr)
+
+    if arr.ndim == 2:
+        return arr[np.newaxis]
+    if arr.ndim == 3:
+        return arr
+    if arr.ndim == 4:
+        show_warning(f"Layer '{layer.name}' is 4D; using channel 0.")
+        return arr[:, 0]
+    raise ValueError(f"Cannot use layer with shape {arr.shape} for detection.")
+
+
+def pt_meta_from_layer(layer):
+    """Return the particle_tracking metadata dict from a napari layer, or {}."""
+    meta = getattr(layer, "metadata", {}) or {}
+    return meta.get("particle_tracking", {}) or {}
