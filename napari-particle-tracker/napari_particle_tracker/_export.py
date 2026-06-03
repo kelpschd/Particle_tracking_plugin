@@ -31,7 +31,7 @@ def add_export_metadata(df: pd.DataFrame, spot_meta=None, track_meta=None, image
     return out
 
 
-def normalize_crop_percentile(crop, lower=2, upper=98):
+def normalize_crop_percentile(crop, lower=1, upper=99):
     """
     crop: (T, C, H, W)
     return uint8 (T, C, H, W)
@@ -392,8 +392,8 @@ def save_track_movies_mp4(
     fps=10,
     channel_colors=None,
     upscale=1,
-    norm_lower=2,
-    norm_upper=98,
+    norm_lower=1,
+    norm_upper=99,
     circle_r=6,
     line_w=2,
     only_track_frames=True,
@@ -430,8 +430,8 @@ def save_track_movies_avi(
     fps=10,
     channel_colors=None,
     upscale=1,
-    norm_lower=2,
-    norm_upper=98,
+    norm_lower=1,
+    norm_upper=99,
     circle_r=6,
     line_w=2,
     only_track_frames=True,
@@ -471,7 +471,7 @@ def _collect_layer_meta(viewer):
         pt_meta = _get_pt_meta(ly)
         role = pt_meta.get("role")
 
-        if ly.__class__.__name__ == "Points" and role == "puncta":
+        if ly.__class__.__name__ == "Points" and role in ("detected_spots", "puncta"):
             pts_layers.append(ly)
 
         if ly.__class__.__name__ == "Tracks" and role == "tracks":
@@ -480,7 +480,6 @@ def _collect_layer_meta(viewer):
     if pts_layers:
         spot_meta = _get_pt_meta(pts_layers[0]).get("run_params", {})
         if not spot_meta:
-            # fallback: some versions stored directly on metadata
             spot_meta = pts_layers[0].metadata.get("run_params", {})
 
     if trk_layers:
@@ -524,8 +523,8 @@ def save_track_gifs(
     padding=40,
     fps=10,
     upscale=2,
-    norm_lower=2,
-    norm_upper=98,
+    norm_lower=1,
+    norm_upper=99,
     channel_colors=None,
     circle_r=6,
     line_w=2,
@@ -832,8 +831,7 @@ def export_all_track_kymographs_from_array(
         img_array = img_array[:, None, :, :]
     T, C, Y, X = img_array.shape
     image_root = os.path.splitext(os.path.basename(image_name))[0]
-    out_root_img = os.path.join(out_root, image_root)
-    os.makedirs(out_root_img, exist_ok=True)
+    os.makedirs(out_root, exist_ok=True)  # no image-named subdir
 
     df = tracks_df.copy()
     if "image_name" in df.columns:
@@ -856,7 +854,7 @@ def export_all_track_kymographs_from_array(
             stack=img_array, frames_0based=frames_used,
             path_xy=path_xy, width_px=W, width_reduce=width_reduce,
         )
-        out_dir = os.path.join(out_root_img, f"particle_{pid}")
+        out_dir = os.path.join(out_root, f"particle_{pid}")  # directly under out_root
         save_kymos(
             out_dir=out_dir, track_id=pid, kymo_ncl=kymo,
             save_float_tif=True, save_png=True, make_rgb=True,

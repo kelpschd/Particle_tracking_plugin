@@ -523,6 +523,10 @@ class ImageImportWidget(QWidget):
 
         image_root = image_root_from_path(self.image_path or "image")
 
+        self._cached_array = np.stack(
+            [ch["array"] for ch in self._channels], axis=1
+        )  # Shape: (T, C, Y, X)
+
         for info in self._channels:
             name = layer_name(image_root, info["label"], "raw")
             kwargs = {
@@ -583,7 +587,13 @@ class ImageImportWidget(QWidget):
 
         try:
             df = _load_csv_flexible(csv_path)
-            has_tracks = "track_id" in df.columns
+            
+            # Clean up track_id if it's all NaN
+            if "track_id" in df.columns and df["track_id"].isna().all():
+                df = df.drop(columns=["track_id"], errors="ignore")
+            
+            # Determine if this is track data (has particle/track_id column)
+            has_tracks = "particle" in df.columns or "track_id" in df.columns
 
             if has_tracks:
                 missing_req, _ = _check_columns(df, TRACKS_REQUIRED, TRACKS_RECOMMENDED, "Tracks")
@@ -623,11 +633,17 @@ class ImageImportWidget(QWidget):
                             pipeline_params=pipeline_params,
                         ),
                     )
-                    tracks_df = core_df[
-                        [c for c in ["particle", "frame", "y", "x"] if c in core_df.columns]
-                    ].copy()
+
+                    # Prepare tracks_df for validation (ensure it has 'particle' column)
+                    tracks_df = core_df.copy()
                     if "particle" not in tracks_df.columns and "track_id" in tracks_df.columns:
                         tracks_df = tracks_df.rename(columns={"track_id": "particle"})
+                    
+                    # Extract only the needed columns for validation
+                    tracks_df = tracks_df[
+                        [c for c in ["particle", "frame", "y", "x"] if c in tracks_df.columns]
+                    ].copy()
+                    
                     try:
                         init_validation_from_tracks(self.viewer, tracks_df)
                     except Exception as e:
@@ -675,14 +691,27 @@ class ImageImportWidget(QWidget):
 
     @staticmethod
     def _build_track_data(core_df):
-        needed = {"track_id", "frame", "y", "x"}
+        # Handle both 'track_id' and 'particle' column names
+        track_id_col = None
+        if "track_id" in core_df.columns and not core_df["track_id"].isna().all():
+            track_id_col = "track_id"
+        elif "particle" in core_df.columns:
+            track_id_col = "particle"
+        
+        if track_id_col is None:
+            return None
+        
+        needed = {track_id_col, "frame", "y", "x"}
         if not needed.issubset(core_df.columns):
             return None
+        
         df = core_df.dropna(subset=list(needed)).copy()
-        df["track_id"] = df["track_id"].astype(int)
-        df["frame"]    = df["frame"].astype(int)
-        df = df.sort_values(["track_id", "frame"])
-        return df[["track_id", "frame", "y", "x"]].to_numpy(dtype=float)
+        df[track_id_col] = df[track_id_col].astype(int)
+        df["frame"] = df["frame"].astype(int)
+        df = df.sort_values([track_id_col, "frame"])
+        
+        # Return in napari Tracks order: [track_id, frame, y, x]
+        return df[[track_id_col, "frame", "y", "x"]].to_numpy(dtype=float)
 
     @staticmethod
     def _split_core_meta(df, core_cols):

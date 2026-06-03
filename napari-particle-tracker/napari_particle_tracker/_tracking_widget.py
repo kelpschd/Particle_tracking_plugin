@@ -435,6 +435,12 @@ class TracksListWidget(QWidget):
         self.table.setShowGrid(False)
         layout.addWidget(self.table, stretch=1)
 
+        # Add manual track button
+        self.add_manual_btn = QPushButton("Add Manual Track")
+        self.add_manual_btn.setToolTip("Create a new track by manually clicking/entering spots")
+        self.add_manual_btn.clicked.connect(self._on_add_manual_track)
+        layout.addWidget(self.add_manual_btn)
+
         # Inline editor (hidden until needed)
         self.editor = TrackEditorWidget(parent=self)
         layout.addWidget(self.editor, stretch=0)
@@ -654,8 +660,27 @@ class TracksListWidget(QWidget):
         state = get_or_create_validation_state(self.viewer)
         rows = state.pending_df[state.pending_df["particle"].astype(int) == particle_id]
         edit_df = rows[["frame", "y", "x"]].copy().reset_index(drop=True)
-        self.editor.load_track(particle_id, edit_df)
+        self.editor.load_track(particle_id, edit_df, is_validated=False, is_new_track=False)
         self._highlight_row_for_particle(particle_id)
+
+    def _on_add_manual_track(self):
+        """Open editor in new-track mode."""
+        state = get_or_create_validation_state(self.viewer)
+        
+        # Generate new particle ID (max existing + 1)
+        if state.pending_df.empty and state.kept_df.empty:
+            new_pid = 0
+        else:
+            all_particles = []
+            if not state.pending_df.empty:
+                all_particles.extend(state.pending_df["particle"].astype(int).unique())
+            if not state.kept_df.empty:
+                all_particles.extend(state.kept_df["particle"].astype(int).unique())
+            new_pid = max(all_particles) + 1 if all_particles else 0
+        
+        # Open editor with empty dataframe
+        empty_df = pd.DataFrame(columns=["frame", "y", "x"])
+        self.editor.load_track(new_pid, empty_df, is_validated=False, is_new_track=True)
 
     def _apply_track_edits(self, particle_id: int, new_spots_df: pd.DataFrame):
         """Called by TrackEditorWidget on save."""
@@ -691,6 +716,37 @@ class TracksListWidget(QWidget):
         self.refresh_from_state()
         show_info(f"Saved edits for track {pid}.")
 
+    def _create_new_track(self, particle_id: int, new_spots_df: pd.DataFrame):
+        """Called by TrackEditorWidget on save for new tracks."""
+        state = get_or_create_validation_state(self.viewer)
+        pid = int(particle_id)
+
+        # Add new rows to pending
+        new_rows = new_spots_df.copy()
+        new_rows["particle"] = pid
+        updated = pd.concat([state.pending_df, new_rows], ignore_index=True)
+        state.pending_df = updated.sort_values(["particle", "frame"]).reset_index(drop=True)
+
+        # Sync to Tracks layer
+        try:
+            all_tracks = pd.concat(
+                [state.pending_df, state.kept_df], ignore_index=True
+            )
+            data, props = dataframe_to_tracks_layer_data(all_tracks)
+            tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
+            if tracks_layers:
+                layer = tracks_layers[0]
+                layer.data = data
+                try:
+                    layer.properties = props
+                except Exception:
+                    pass
+        except Exception as e:
+            show_warning(f"Could not sync new track to Tracks layer: {e}")
+
+        self.refresh_from_state()
+        show_info(f"Created new track {pid}.")
+
     def _remove_row_for_particle(self, particle_id: int):
         pid_str = str(int(particle_id))
         for r in range(self.table.rowCount()):
@@ -721,7 +777,7 @@ class TracksListWidget(QWidget):
                     self.viewer.layers.remove(layer)
                 except Exception:
                     pass
-    
+
 
 class TrackEditorWidget(QWidget):
     """
@@ -729,10 +785,12 @@ class TrackEditorWidget(QWidget):
     add/remove/edit/save/cancel. Meant to be placed under TracksListWidget.table.
     """
 
-    def __init__(self, parent: "TracksListWidget" = None):
+    def __init__(self, parent = None):
         super().__init__(parent)
-        self.parent_widget: "TracksListWidget" = parent
+        self.parent_widget = parent  # Can be TracksListWidget or ValidatedTracksWidget
         self.current_pid = None
+        self._is_validated = False  # Track whether we're editing validated or pending
+        self._is_new_track = False  # Track whether we're creating a new track
         self._build_ui()
         self.setVisible(False)  # hidden until needed
 
@@ -784,10 +842,17 @@ class TrackEditorWidget(QWidget):
         self.cancel_btn.clicked.connect(self._on_cancel)
         self.save_btn.clicked.connect(self._on_save)
 
-    def load_track(self, pid: int, spots_df: pd.DataFrame):
+    def load_track(self, pid: int, spots_df: pd.DataFrame, is_validated: bool = False, is_new_track: bool = False):
         """Populate the editor with the given particle id's rows (frame,y,x)."""
         self.current_pid = int(pid)
-        self.title_label.setText(f"Edit track: {self.current_pid}")
+        self._is_validated = is_validated
+        self._is_new_track = is_new_track
+        
+        if is_new_track:
+            self.title_label.setText(f"New track: {self.current_pid}")
+        else:
+            self.title_label.setText(f"Edit track: {self.current_pid}")
+        
         self._populate_from_df(spots_df)
         self.setVisible(True)
         # ensure parent layout shows the editor
@@ -843,7 +908,6 @@ class TrackEditorWidget(QWidget):
 
         # start pick mode
         self._start_pick_mode(viewer)
-
 
     def _manual_add_row(self):
         """Original fallback behaviour: insert an editable empty row."""
@@ -1012,6 +1076,7 @@ class TrackEditorWidget(QWidget):
     def _on_cancel(self):
         self.setVisible(False)
         self.current_pid = None
+        self._is_new_track = False
 
     def _on_save(self):
         try:
@@ -1019,10 +1084,20 @@ class TrackEditorWidget(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "Invalid data", str(e))
             return
+        
+        if df.empty:
+            QMessageBox.warning(self, "Empty track", "Cannot save a track with no spots. Add at least one spot.")
+            return
+        
         if self.parent_widget is not None:
-            self.parent_widget._apply_track_edits(self.current_pid, df)
+            if self._is_new_track:
+                self.parent_widget._create_new_track(self.current_pid, df)
+            else:
+                self.parent_widget._apply_track_edits(self.current_pid, df)
+        
         self.setVisible(False)
         self.current_pid = None
+        self._is_new_track = False
 
     def _on_show_spot_button(self, button: QPushButton):
         try:
@@ -1068,3 +1143,268 @@ class TrackEditorWidget(QWidget):
                 viewer.camera.center = tuple(new_cc)
         except Exception:
             pass
+
+class ValidatedTracksWidget(QWidget):
+    """
+    A widget that displays kept tracks in a table similar to TracksListWidget,
+    with Show, Edit, and Delete buttons per track.
+    """
+
+    def __init__(self, viewer: napari.Viewer, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self._build_ui()
+        self.refresh_from_state()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Status bar
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.status_label.setMinimumHeight(24)
+        layout.addWidget(self.status_label)
+
+        header = QLabel("Validated Tracks")
+        header.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setMinimumHeight(40)
+        layout.addWidget(header)
+
+        # Table: Track ID | Frames (range) | Count | Show | Edit | Delete
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Track ID", "Frames\n(Range)", "Count", "", "", ""]
+        )
+        header_view = self.table.horizontalHeader()
+        for col, width in enumerate([60, 80, 50, 55, 55, 60]):
+            header_view.setSectionResizeMode(col, QHeaderView.Fixed)
+            self.table.setColumnWidth(col, width)
+
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        layout.addWidget(self.table, stretch=1)
+
+        # Inline editor (hidden until needed)
+        self.editor = TrackEditorWidget(parent=self)
+        layout.addWidget(self.editor, stretch=0)
+
+        layout.addStretch(1)
+
+    def refresh_from_state(self):
+        """Re-populate table from ValidationState.kept_df."""
+        state = get_or_create_validation_state(self.viewer)
+        self._populate_table(state.kept_df)
+        self._update_status_label(state)
+
+    def _update_status_label(self, state):
+        self.status_label.setText(
+            f"Validated: {state.n_kept}  |  "
+            f"Pending: {state.n_pending}  |  "
+            f"Deleted: {state.n_deleted}"
+        )
+
+    def _populate_table(self, tracks_df: pd.DataFrame):
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.clearContents()
+            self.table.setRowCount(0)
+
+            if tracks_df is None or tracks_df.empty:
+                return
+
+            pids = np.sort(tracks_df["particle"].astype(int).unique())
+            self.table.setRowCount(len(pids))
+
+            for row_idx, pid in enumerate(pids):
+                group = tracks_df[tracks_df["particle"].astype(int) == int(pid)]
+                group = group.sort_values("frame") if "frame" in group.columns else group
+
+                if not group.empty and "frame" in group.columns:
+                    frames = sorted(group["frame"].unique().tolist())
+                    frames_text = f"{int(frames[0])} – {int(frames[-1])}"
+                    length = len(group)
+                else:
+                    frames_text = "N/A"
+                    length = 0
+
+                def _item(text):
+                    it = QTableWidgetItem(str(text))
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    return it
+
+                self.table.setItem(row_idx, 0, _item(int(pid)))
+                self.table.setItem(row_idx, 1, _item(frames_text))
+                self.table.setItem(row_idx, 2, _item(length))
+
+                # Show
+                show_btn = QPushButton("Show")
+                show_btn.setMaximumWidth(55)
+                show_btn.setMaximumHeight(25)
+                show_btn.setStyleSheet("QPushButton { font-weight: bold; }")
+                show_btn.clicked.connect(partial(self.on_show_clicked, int(pid)))
+                self.table.setCellWidget(row_idx, 3, centered_cell_widget(show_btn))
+
+                # Edit
+                edit_btn = QPushButton("Edit")
+                edit_btn.setMaximumWidth(55)
+                edit_btn.setMaximumHeight(25)
+                edit_btn.setStyleSheet("QPushButton { font-weight: bold; }")
+                edit_btn.clicked.connect(partial(self._on_edit_clicked, int(pid)))
+                self.table.setCellWidget(row_idx, 4, centered_cell_widget(edit_btn))
+
+                # Delete
+                del_btn = QPushButton("Delete")
+                del_btn.setMaximumWidth(55)
+                del_btn.setMaximumHeight(25)
+                del_btn.setStyleSheet("QPushButton { background-color: red; }")
+                del_btn.clicked.connect(partial(self.on_delete_clicked, int(pid)))
+                self.table.setCellWidget(row_idx, 5, centered_cell_widget(del_btn))
+
+            if self.table.rowCount() > 0:
+                self.table.selectRow(0)
+        finally:
+            self.table.setUpdatesEnabled(True)
+
+    def on_show_clicked(self, particle_id: int):
+        state = get_or_create_validation_state(self.viewer)
+        df = state.kept_df
+        if df.empty:
+            return
+        group = df[df["particle"].astype(int) == int(particle_id)].sort_values("frame")
+        if group.empty:
+            return
+
+        y_coords = group["y"].to_numpy(dtype=float)
+        x_coords = group["x"].to_numpy(dtype=float)
+        frames = group["frame"].to_numpy(dtype=int)
+
+        if len(x_coords) == 0:
+            return
+
+        cx = 0.5 * (x_coords.min() + x_coords.max())
+        cy = 0.5 * (y_coords.min() + y_coords.max())
+
+        try:
+            self.viewer.dims.set_point(0, int(frames[0]))
+        except Exception:
+            pass
+
+        try:
+            cc = tuple(self.viewer.camera.center)
+            if len(cc) == 2:
+                self.viewer.camera.center = (float(cx), float(cy))
+            elif len(cc) == 3:
+                self.viewer.camera.center = (float(cc[0]), float(cy), float(cx))
+            else:
+                new_cc = list(cc)
+                new_cc[-2] = float(cy)
+                new_cc[-1] = float(cx)
+                self.viewer.camera.center = tuple(new_cc)
+        except Exception:
+            try:
+                self.viewer.dims.set_point(1, int(round(cy)))
+                self.viewer.dims.set_point(2, int(round(cx)))
+            except Exception:
+                pass
+
+        try:
+            width = max(1.0, x_coords.max() - x_coords.min())
+            height = max(1.0, y_coords.max() - y_coords.min())
+            zoom = max(0.2, min(10.0, 200.0 / max(width, height)))
+            self.viewer.camera.zoom = float(zoom)
+        except Exception:
+            pass
+
+        self._highlight_row_for_particle(particle_id)
+
+    def _on_edit_clicked(self, particle_id: int):
+        state = get_or_create_validation_state(self.viewer)
+        rows = state.kept_df[state.kept_df["particle"].astype(int) == particle_id]
+        edit_df = rows[["frame", "y", "x"]].copy().reset_index(drop=True)
+        self.editor.load_track(particle_id, edit_df, is_validated=True)
+        self._highlight_row_for_particle(particle_id)
+
+    def on_delete_clicked(self, particle_id: int):
+        """Delete a validated track and move it to deleted."""
+        state = get_or_create_validation_state(self.viewer)
+        state.delete(particle_id)
+        self._update_status_label(state)
+        self._remove_row_for_particle(particle_id)
+
+        # Remove from napari Tracks layer
+        self._remove_particle_from_tracks_layer(particle_id)
+
+        show_info(f"Track {particle_id} deleted from validated.")
+
+    def _remove_particle_from_tracks_layer(self, particle_id: int):
+        tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
+        if not tracks_layers:
+            return
+        layer = tracks_layers[0]
+        try:
+            full_df = tracks_layer_to_dataframe(layer)
+            remaining = full_df[full_df["particle"].astype(int) != particle_id].reset_index(drop=True)
+            new_data, new_props = dataframe_to_tracks_layer_data(remaining)
+            layer.data = new_data
+            try:
+                layer.properties = new_props
+            except Exception:
+                pass
+        except Exception as e:
+            show_warning(f"Could not update Tracks layer: {e}")
+
+    def _apply_track_edits(self, particle_id: int, new_spots_df: pd.DataFrame):
+        """Called by TrackEditorWidget on save."""
+        state = get_or_create_validation_state(self.viewer)
+        pid = int(particle_id)
+
+        # Remove old rows for pid from kept
+        remaining = state.kept_df[
+            state.kept_df["particle"].astype(int) != pid
+        ].copy()
+        new_rows = new_spots_df.copy()
+        new_rows["particle"] = pid
+        updated = pd.concat([remaining, new_rows], ignore_index=True)
+        state.kept_df = updated.sort_values(["particle", "frame"]).reset_index(drop=True)
+
+        # Sync to Tracks layer
+        try:
+            all_tracks = pd.concat(
+                [state.pending_df, state.kept_df], ignore_index=True
+            )
+            data, props = dataframe_to_tracks_layer_data(all_tracks)
+            tracks_layers = [ly for ly in self.viewer.layers if ly.__class__.__name__ == "Tracks"]
+            if tracks_layers:
+                layer = tracks_layers[0]
+                layer.data = data
+                try:
+                    layer.properties = props
+                except Exception:
+                    pass
+        except Exception as e:
+            show_warning(f"Could not sync edits to Tracks layer: {e}")
+
+        self.refresh_from_state()
+        show_info(f"Saved edits for track {pid}.")
+
+    def _remove_row_for_particle(self, particle_id: int):
+        pid_str = str(int(particle_id))
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item is not None and item.text() == pid_str:
+                self.table.removeRow(r)
+                return
+
+    def _highlight_row_for_particle(self, particle_id: int):
+        pid_str = str(int(particle_id))
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item is not None and item.text() == pid_str:
+                self.table.setCurrentCell(r, 0)
+                self.table.selectRow(r)
+                return

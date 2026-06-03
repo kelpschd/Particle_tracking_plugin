@@ -10,7 +10,7 @@ from napari.qt.threading import thread_worker
 from ._detection_preview_widget import DetectionPreviewWidget
 from ._tracking_widget import tracking_widget, TracksListWidget
 from ._image_import_widget import ImageImportWidget
-from .tracks_table_widget import TracksTableWidget
+from ._tracking_widget import ValidatedTracksWidget
 from ._helpers import (
     tracks_layer_to_dataframe,
     dataframe_to_tracks_layer_data,
@@ -74,14 +74,8 @@ def make_plugin_gui(viewer=None, **_):
     val_layout = QVBoxLayout(validated_page)
     val_layout.setContentsMargins(0, 0, 0, 0)
     val_layout.setSpacing(0)
-    val_layout.addWidget(QLabel("Validated (kept) tracks"))
-    state = get_or_create_validation_state(viewer)
-    validated_table = TracksTableWidget(
-        viewer=viewer,
-        tracks_layer=None,
-        tracks_df=state.kept_df,
-    )
-    val_layout.addWidget(validated_table)
+    validated_widget = ValidatedTracksWidget(viewer=viewer)
+    val_layout.addWidget(validated_widget)
     tabs.addTab(validated_page, "Validated Tracks")
 
     # --- Export tab ---
@@ -231,9 +225,7 @@ def make_plugin_gui(viewer=None, **_):
         viewer.window.add_dock_widget(widget, name="Tracks List", area="right")
         _TRACKS_LIST_WIDGETS[vid] = widget
         widget.track_kept.connect(
-            lambda: validated_table.__setattr__(
-                "dataframe", get_or_create_validation_state(viewer).kept_df
-            )
+            lambda: validated_widget.refresh_from_state()
         )
 
     open_tracks_list_btn.clicked.connect(_open_tracks_list_singleton)
